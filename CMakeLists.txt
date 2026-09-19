@@ -25,6 +25,7 @@ add_library(llmrt_core STATIC
   src/io/safetensors.cpp
   src/model/config.cpp
   src/model/weights.cpp
+  src/ops/cpu/rmsnorm.cpp
 )
 target_include_directories(llmrt_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
