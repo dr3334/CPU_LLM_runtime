@@ -41,19 +41,24 @@ void rmsnorm(const Tensor& x, const Tensor& weight, Tensor& out, float eps) {
   const int64_t n = x.dim(x.rank() - 1);
   const int64_t rows = static_cast<int64_t>(x.numel() / static_cast<size_t>(n));
 
-  const float* xp = x.f32();
-  const float* wp = weight.f32();
-  float* op = out.f32();
+  // One base pointer per buffer. The `_base` suffix marks them as the origins
+  // that rows are offset from; `w` is indexed elementwise and is named to match
+  // the w[j] in the formula  out[j] = w[j] * x[j] * scale.
+  const float* x_base = x.f32();
+  const float* w = weight.f32();
+  float* out_base = out.f32();
 
   for (int64_t r = 0; r < rows; ++r) {
-    const float* row = xp + r * n;
-    float* dst = op + r * n;
+    // Row r begins r*n elements into each buffer, because the leading axes were
+    // flattened into rows and only the last axis is normalised.
+    const float* x_row = x_base + r * n;
+    float* out_row = out_base + r * n;
 
     // Pass 1: sum of squares. Must finish before any output is written,
     // because the scale factor depends on the entire row.
     float sum_sq = 0.0f;
     for (int64_t j = 0; j < n; ++j) {
-      sum_sq += row[j] * row[j];
+      sum_sq += x_row[j] * x_row[j];
     }
 
     // eps goes AFTER the mean and INSIDE the sqrt: rsqrt(mean + eps), not
@@ -66,7 +71,7 @@ void rmsnorm(const Tensor& x, const Tensor& weight, Tensor& out, float eps) {
     // is still resident in L1 at the sizes we care about (n = 1024 -> 4 KiB),
     // so this second pass does not go back to memory.
     for (int64_t j = 0; j < n; ++j) {
-      dst[j] = wp[j] * (row[j] * scale);
+      out_row[j] = w[j] * (x_row[j] * scale);
     }
   }
 }

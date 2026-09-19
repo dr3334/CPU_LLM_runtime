@@ -58,6 +58,68 @@ bool rmsnorm_rejects(const std::vector<float>& x, const std::vector<int64_t>& x_
   return false;
 }
 
+// Independent reimplementation that accumulates the sum of squares in double,
+// mirroring the alternative implementation under discussion. Used only to
+// measure the accumulator-width choice against the golden.
+std::vector<float> rmsnorm_double_accumulator(const std::vector<float>& x,
+                                              const std::vector<int64_t>& x_shape,
+                                              const std::vector<float>& w, float eps) {
+  const int64_t n = x_shape.back();
+  const int64_t rows = static_cast<int64_t>(x.size()) / n;
+  std::vector<float> out(x.size());
+  for (int64_t r = 0; r < rows; ++r) {
+    const float* row = x.data() + r * n;
+    double sum = 0.0;
+    for (int64_t j = 0; j < n; ++j) {
+      const double v = row[j];
+      sum += v * v;
+    }
+    const float mean = static_cast<float>(sum / static_cast<double>(n));
+    const float scale = 1.0f / std::sqrt(mean + eps);
+    for (int64_t j = 0; j < n; ++j) out[r * n + j] = w[j] * (row[j] * scale);
+  }
+  return out;
+}
+
+// Runs one matmul and returns the output [M, N].
+std::vector<float> run_matmul(const std::vector<float>& a, const std::vector<int64_t>& a_shape,
+                              const std::vector<float>& b, const std::vector<int64_t>& b_shape,
+                              bool transpose_b) {
+  const int64_t M = a_shape[0];
+  const int64_t N = transpose_b ? b_shape[0] : b_shape[1];
+  std::vector<float> out(static_cast<size_t>(M * N));
+  Tensor at = view_of(a, a_shape);
+  Tensor bt = view_of(b, b_shape);
+  Tensor ot = view_of(out, {M, N});
+  cpu::matmul(at, bt, ot, transpose_b);
+  return out;
+}
+
+// Checks one Qwen3 projection against its captured golden output. `in_key` is a
+// [1, 12, K] activation, `weight_name` a [N, K] nn.Linear weight, `want_key` the
+// [1, 12, N] result.
+void check_projection(const golden::Store& g, const SafeTensors& st,
+                      const std::string& in_key, const std::string& weight_name,
+                      const std::string& want_key, int64_t K, int64_t N,
+                      const char* label) {
+  const golden::Array* in = g.get(in_key);
+  const golden::Array* want = g.get(want_key);
+  CHECK_TRUE(in != nullptr && want != nullptr);
+  if (in == nullptr || want == nullptr) return;
+
+  const std::vector<float> w = st.to_f32(weight_name);
+  CHECK_MSG(w.size() == static_cast<size_t>(K) * static_cast<size_t>(N),
+            std::string(label) + ": weight has unexpected size");
+
+  // [1, 12, K] -> [12, K] is a free reshape (contiguous).
+  const std::vector<float> out = run_matmul(in->f32, {12, K}, w, {N, K}, true);
+
+  const golden::Diff d = golden::compare(out.data(), want->f(), want->numel());
+  std::printf("      %-10s M=12 K=%-5lld N=%-5lld  %s\n", label, (long long)K, (long long)N,
+              golden::diff_string(d).c_str());
+  CHECK_MSG(golden::within(d), std::string(label) + ": " + golden::diff_string(d));
+}
+
 std::string model_path(const char* file) {
   return golden::default_model_dir() + "/" + file;
 }
@@ -269,6 +331,213 @@ LLMRT_TEST(rmsnorm_rejects_wrong_dtype) {
     cpu::rmsnorm(bf16, wv, ov, 1e-6f);
   } catch (const Error&) {
     threw = true;
+  }
+  CHECK_TRUE(threw);
+}
+
+// The accumulator width is a design choice worth measuring rather than arguing
+// about. A double accumulator is more accurate in the mathematical sense, but
+// the golden was itself produced with fp32 reductions -- so "more accurate than
+// the reference" is not the same as "closer to the reference". Both are checked
+// so the numbers, not the intuition, decide.
+LLMRT_TEST(rmsnorm_accumulator_width_float_vs_double) {
+  golden::Store g;
+  if (!g.available() || !checkpoint_exists()) return;
+  const golden::Array* in = g.get("input_layernorm_in");
+  const golden::Array* want = g.get("input_layernorm_out");
+  CHECK_TRUE(in != nullptr && want != nullptr);
+
+  const SafeTensors st = SafeTensors::open(model_path("model.safetensors"));
+  const std::vector<float> w = st.to_f32("model.layers.0.input_layernorm.weight");
+
+  const std::vector<float> f = run_rmsnorm(in->f32, in->shape, w);
+  const std::vector<float> d = rmsnorm_double_accumulator(in->f32, in->shape, w, 1e-6f);
+
+  const golden::Diff df = golden::compare(f.data(), want->f(), want->numel());
+  const golden::Diff dd = golden::compare(d.data(), want->f(), want->numel());
+  std::printf("      float  accumulator  %s\n", golden::diff_string(df).c_str());
+  std::printf("      double accumulator  %s\n", golden::diff_string(dd).c_str());
+
+  // Only the accumulator differs, so the two must agree to within its error.
+  const golden::Diff dff = golden::compare(d.data(), f.data(), f.size());
+  std::printf("      float vs double     %s\n", golden::diff_string(dff).c_str());
+
+  CHECK_MSG(golden::within(df), "float accumulator: " + golden::diff_string(df));
+  CHECK_MSG(golden::within(dd), "double accumulator: " + golden::diff_string(dd));
+}
+
+// ---------------------------------------------------------------------------
+// matmul -- the Qwen3 projection path, out = a @ b^T
+// ---------------------------------------------------------------------------
+
+// All four distinct projection shapes are checked, because between them they
+// exercise K = 1024/2048/3072 and N = 1024/2048/3072. If the indexing ever
+// confuses M, N and K, at least one of these disagrees.
+LLMRT_TEST(matmul_matches_golden_q_proj) {
+  golden::Store g;
+  if (!g.available() || !checkpoint_exists()) return;
+  const SafeTensors st = SafeTensors::open(model_path("model.safetensors"));
+  // q_proj makes the head dimension visible: 1024 in, 2048 = 16 heads x 128 out.
+  check_projection(g, st, "input_layernorm_out", "model.layers.0.self_attn.q_proj.weight",
+                   "q_proj_out", 1024, 2048, "q_proj");
+}
+
+LLMRT_TEST(matmul_matches_golden_o_proj) {
+  // o_proj projects the other way: 2048 (merged heads) back down to 1024.
+  golden::Store g;
+  if (!g.available() || !checkpoint_exists()) return;
+  const SafeTensors st = SafeTensors::open(model_path("model.safetensors"));
+  check_projection(g, st, "attn_out", "model.layers.0.self_attn.o_proj.weight", "o_proj_out",
+                   2048, 1024, "o_proj");
+}
+
+LLMRT_TEST(matmul_matches_golden_gate_proj) {
+  golden::Store g;
+  if (!g.available() || !checkpoint_exists()) return;
+  const SafeTensors st = SafeTensors::open(model_path("model.safetensors"));
+  check_projection(g, st, "post_attention_layernorm_out",
+                   "model.layers.0.mlp.gate_proj.weight", "gate_proj_out", 1024, 3072,
+                   "gate_proj");
+}
+
+LLMRT_TEST(matmul_matches_golden_down_proj) {
+  // The widest K in the model.
+  golden::Store g;
+  if (!g.available() || !checkpoint_exists()) return;
+  const SafeTensors st = SafeTensors::open(model_path("model.safetensors"));
+  check_projection(g, st, "swiglu_out", "model.layers.0.mlp.down_proj.weight", "down_proj_out",
+                   3072, 1024, "down_proj");
+}
+
+// ---------------------------------------------------------------------------
+// matmul properties
+// ---------------------------------------------------------------------------
+
+LLMRT_TEST(matmul_produces_hand_computed_values) {
+  // a = [[1,2],[3,4]]   b = [[5,6],[7,8]] stored as [N=2, K=2]
+  // a @ b^T = [[1*5+2*6, 1*7+2*8], [3*5+4*6, 3*7+4*8]] = [[17,23],[39,53]]
+  const std::vector<float> a = {1, 2, 3, 4};
+  const std::vector<float> b = {5, 6, 7, 8};
+  const std::vector<float> out = run_matmul(a, {2, 2}, b, {2, 2}, true);
+  CHECK_NEAR(out[0], 17.0, 1e-6);
+  CHECK_NEAR(out[1], 23.0, 1e-6);
+  CHECK_NEAR(out[2], 39.0, 1e-6);
+  CHECK_NEAR(out[3], 53.0, 1e-6);
+}
+
+LLMRT_TEST(matmul_by_identity_returns_the_other_operand) {
+  const std::vector<float> a = {1, 2, 3, 4, 5, 6};            // [2, 3]
+  const std::vector<float> eye = {1, 0, 0, 0, 1, 0, 0, 0, 1};  // [3, 3]
+  const std::vector<float> out = run_matmul(a, {2, 3}, eye, {3, 3}, true);
+  for (size_t i = 0; i < a.size(); ++i) CHECK_NEAR(out[i], a[i], 1e-6);
+}
+
+// Cross-checks the two branches against each other. A bug in either indexing
+// scheme shows up as a disagreement, and the two use completely different loop
+// orders (dot-product vs outer-product) so they are unlikely to be wrong in
+// the same way.
+LLMRT_TEST(matmul_both_transpose_modes_agree) {
+  const int64_t M = 3, K = 4, N = 5;
+  std::vector<float> a(static_cast<size_t>(M * K));
+  std::vector<float> b(static_cast<size_t>(N * K));
+  for (size_t i = 0; i < a.size(); ++i) a[i] = 0.5f * static_cast<float>(i) - 1.0f;
+  for (size_t i = 0; i < b.size(); ++i) b[i] = 1.0f - 0.25f * static_cast<float>(i);
+
+  // Materialise b^T as [K, N] so the same product can be computed both ways.
+  std::vector<float> b_t(static_cast<size_t>(K * N));
+  for (int64_t n = 0; n < N; ++n)
+    for (int64_t k = 0; k < K; ++k)
+      b_t[static_cast<size_t>(k * N + n)] = b[static_cast<size_t>(n * K + k)];
+
+  const std::vector<float> o_tb = run_matmul(a, {M, K}, b, {N, K}, true);
+  const std::vector<float> o_tf = run_matmul(a, {M, K}, b_t, {K, N}, false);
+
+  const golden::Diff d = golden::compare(o_tf.data(), o_tb.data(), o_tb.size());
+  CHECK_MSG(golden::within(d), "transpose_b branches disagree: " + golden::diff_string(d));
+}
+
+LLMRT_TEST(matmul_supports_a_single_row_decode) {
+  // M=1 is the decode shape: one token at a time. This is the hot path, and it
+  // is memory bound on streaming the weight.
+  const int64_t K = 8, N = 4;
+  std::vector<float> a(K);
+  std::vector<float> b(static_cast<size_t>(N * K));
+  for (size_t i = 0; i < a.size(); ++i) a[i] = 1.0f;  // all ones: out[j] = sum of b row j
+  for (size_t i = 0; i < b.size(); ++i) b[i] = static_cast<float>(i);
+
+  const std::vector<float> out = run_matmul(a, {1, K}, b, {N, K}, true);
+  CHECK_EQ(out.size(), size_t{4});
+  for (int64_t j = 0; j < N; ++j) {
+    float row_sum = 0.0f;
+    for (int64_t k = 0; k < K; ++k) row_sum += b[static_cast<size_t>(j * K + k)];
+    CHECK_NEAR(out[static_cast<size_t>(j)], row_sum, 1e-5);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// matmul argument validation
+// ---------------------------------------------------------------------------
+
+LLMRT_TEST(matmul_rejects_disagreeing_inner_dimensions) {
+  const std::vector<float> a = {1, 2, 3, 4, 5, 6};  // [2, 3], so K=3
+  const std::vector<float> b(20, 0.0f);             // [4, 5], inner dim 5 != 3
+  std::vector<float> out(8, 0.0f);                  // [2, 4]
+  Tensor at = view_of(a, {2, 3});
+  Tensor bt = view_of(b, {4, 5});
+  Tensor ot = view_of(out, {2, 4});
+  bool threw = false;
+  try {
+    cpu::matmul(at, bt, ot, true);
+  } catch (const Error& e) {
+    threw = true;
+    CHECK_MSG(std::string(e.what()).find("inner dimensions") != std::string::npos, e.what());
+  }
+  CHECK_TRUE(threw);
+}
+
+LLMRT_TEST(matmul_rejects_output_shape_mismatch) {
+  const std::vector<float> a = {1, 2, 3, 4, 5, 6};  // [2, 3]
+  const std::vector<float> b = {1, 0, 0, 1, 0, 0};  // [2, 3] -> out should be [2, 2]
+  std::vector<float> out(6, 0.0f);                  // [3, 2]: wrong
+  Tensor at = view_of(a, {2, 3});
+  Tensor bt = view_of(b, {2, 3});
+  Tensor ot = view_of(out, {3, 2});
+  bool threw = false;
+  try {
+    cpu::matmul(at, bt, ot, true);
+  } catch (const Error& e) {
+    threw = true;
+    CHECK_MSG(std::string(e.what()).find("out should be") != std::string::npos, e.what());
+  }
+  CHECK_TRUE(threw);
+}
+
+LLMRT_TEST(matmul_rejects_non_2d_operands) {
+  // Callers reshape higher-rank activations, so a 3-D input is a caller bug.
+  std::vector<float> a(24, 1.0f), b(24, 1.0f), out(8, 0.0f);
+  Tensor at = view_of(a, {2, 3, 4});
+  Tensor bt = view_of(b, {4, 6});
+  Tensor ot = view_of(out, {2, 4});
+  bool threw = false;
+  try {
+    cpu::matmul(at, bt, ot, true);
+  } catch (const Error&) {
+    threw = true;
+  }
+  CHECK_TRUE(threw);
+}
+
+LLMRT_TEST(matmul_rejects_strided_input) {
+  std::vector<float> a(6, 1.0f), b(6, 1.0f), out(4, 0.0f);
+  Tensor at = view_of(a, {2, 3}).transpose(0, 1);  // strided, [3, 2]
+  Tensor bt = view_of(b, {2, 3});
+  Tensor ot = view_of(out, {2, 2});
+  bool threw = false;
+  try {
+    cpu::matmul(at, bt, ot, true);
+  } catch (const Error& e) {
+    threw = true;
+    CHECK_MSG(std::string(e.what()).find("matmul") != std::string::npos, e.what());
   }
   CHECK_TRUE(threw);
 }

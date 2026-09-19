@@ -30,5 +30,24 @@ namespace cpu {
 // equals the last axis: hidden_size for the block norms, head_dim for QK-Norm.
 void rmsnorm(const Tensor& x, const Tensor& weight, Tensor& out, float eps);
 
+// Matrix multiply with an optional transposed right-hand operand.
+//
+//   transpose_b == true :  a [M, K] @ b [N, K]  ->  out [M, N]
+//                          out[i][j] = sum_k a[i][k] * b[j][k]
+//
+//   transpose_b == false:  a [M, K] @ b [K, N]  ->  out [M, N]
+//                          out[i][j] = sum_k a[i][k] * b[k][j]
+//
+// All three tensors must be 2-D, contiguous, f32 and on the host. Callers with
+// higher-rank activations reshape first ([1, 12, 1024] -> [12, 1024]); that is
+// free for contiguous data.
+//
+// Qwen3 uses the transposed form everywhere: every projection weight is stored
+// as [out_features, in_features] (nn.Linear's layout), so a projection is
+// matmul(x, W, y, /*transpose_b=*/true). Materialising W^T instead would copy
+// 1.2 GB of weights, and this layout is in fact the better one -- the inner
+// loop becomes a dot product between two contiguous rows.
+void matmul(const Tensor& a, const Tensor& b, Tensor& out, bool transpose_b);
+
 }  // namespace cpu
 }  // namespace llmrt
