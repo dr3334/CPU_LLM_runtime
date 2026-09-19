@@ -19,6 +19,7 @@ option(LLMRT_ENABLE_AVX2 "Enable AVX2/FMA CPU kernels" OFF)
 # ---------------------------------------------------------------------------
 add_library(llmrt_core STATIC
   src/core/json.cpp
+  src/core/tensor.cpp
   src/core/version.cpp
   src/io/convert.cpp
   src/io/safetensors.cpp

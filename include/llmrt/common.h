@@ -48,17 +48,23 @@ inline const char* device_name(DeviceKind d) {
   return "?";
 }
 
-// Size in bytes of a single element of `t`.
+// Size in bytes of a single element of `t`. Only meaningful for byte-
+// addressable dtypes -- check dtype_is_packed() first. For I4 the two nibbles
+// share a byte, so this returns 1 while the element size is really 4 bits.
 inline size_t dtype_size(DType t) {
   switch (t) {
     case DType::F32: return 4;
     case DType::BF16: return 2;
     case DType::F16: return 2;
     case DType::I8: return 1;
-    case DType::I4: return 1;  // packed 2-per-byte; callers must handle packing
+    case DType::I4: return 1;
   }
   return 0;
 }
+
+// True when elements are not byte-addressable and share storage. Callers that
+// need a byte count must round up (see Tensor::nbytes).
+inline bool dtype_is_packed(DType t) { return t == DType::I4; }
 
 // ---------------------------------------------------------------------------
 // Error handling

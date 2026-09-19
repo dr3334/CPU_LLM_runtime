@@ -129,12 +129,13 @@ they are all confirmed against `modeling_qwen3.py`:
 ```
 include/llmrt/       public headers
   common.h           DType, DeviceKind, Error, LLMRT_CHECK
+  tensor.h           Tensor: non-owning typed view (ptr + offset + shape + strides)
   json.h             hand-written JSON parser
   safetensors.h      mmap'd checkpoint reader
   convert.h          bf16/f16 -> f32
   config.h           Qwen3Config
   model.h            weight binding (Qwen3Weights, LayerWeights)
-src/core/            json, version
+src/core/            json, tensor, version
 src/io/              safetensors, convert
 src/model/           config, weights
 src/cli/             main + one cmd_*.cpp per subcommand (thin, no logic)
@@ -142,6 +143,15 @@ tools/               Python: golden generation, oracle checking
 tests/               harness + one file per area; golden.h loads fixtures
 kernels/             (reserved for hand-written OpenCL)
 ```
+
+`Tensor` is a **view, not an owner**: it holds `data` (host pointer, or a
+`cl_mem` once the OpenCL backend lands), an element `offset`, shape and
+strides. Ownership stays with whoever allocated the bytes — the memory manager,
+or a `std::vector` in a test — so there is exactly one place that decides when
+memory is freed. Strides exist from the start because attention reads the same
+buffer as `[seq, heads, dim]` and as `[heads, seq, dim]`; the CPU ops currently
+require contiguous input and call `require_contiguous()` to reject strided
+views loudly rather than reading the wrong elements.
 
 Implemented today: the metadata and loading layer. `llmrt inspect` prints the
 config, the full tensor table and the memory footprint, and is the fastest way

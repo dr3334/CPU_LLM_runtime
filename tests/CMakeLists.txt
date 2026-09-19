@@ -15,6 +15,7 @@ function(llmrt_add_test name)
 endfunction()
 
 llmrt_add_test(test_smoke test_smoke.cpp)
+llmrt_add_test(test_tensor test_tensor.cpp)
 llmrt_add_test(test_json test_json.cpp)
 llmrt_add_test(test_safetensors test_safetensors.cpp)
 llmrt_add_test(test_config test_config.cpp)
