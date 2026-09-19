@@ -1,0 +1,16 @@
+# build trees
+build/
+build-*/
+
+# generated golden data (large, reproducible via tools/gen_oracle.py)
+data/golden/
+
+# python tooling
+tools/.venv/
+__pycache__/
+*.pyc
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store

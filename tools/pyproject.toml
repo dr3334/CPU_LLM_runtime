@@ -1,0 +1,22 @@
+[project]
+name = "llmrt-tools"
+version = "0.1.0"
+description = "Offline tooling for llmrt: golden-data generation and numerical comparison. Never linked into the C++ inference path."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0",
+    "torch>=2.7",
+    # Pinned: the golden data is only reproducible if the reference
+    # implementation matches. 4.51.0 is what the vendored
+    # `transformers_qwen3` snapshot under mtk_toolkit_enhence corresponds to.
+    "transformers==4.51.0",
+    "safetensors>=0.4",
+    "tokenizers>=0.21",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.6"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
