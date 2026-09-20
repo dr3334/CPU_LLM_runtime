@@ -63,5 +63,41 @@ void matmul(const Tensor& a, const Tensor& b, Tensor& out, bool transpose_b);
 // bits, so it is not used here.
 void swiglu(const Tensor& gate, const Tensor& up, Tensor& out);
 
+// Rotary position embedding, split into the two halves that are worth testing
+// separately (and that have different lifetimes -- the tables are built once
+// per forward and reused by all 28 layers).
+//
+// Qwen3 uses the half-split (GPT-NeoX) convention, not the interleaved one:
+// rotate_half pairs element j with element j + head_dim/2 and negates the
+// front half. Getting this wrong still produces finite, plausible activations.
+//
+// The tables have the shape [seq_len, head_dim]:
+//
+//   inv_freq[i] = 1 / theta^(2i / head_dim)       i in [0, head_dim/2)
+//   angle[p][j] = p * inv_freq[j % (head_dim/2)]
+//   cos[p][j]   = cos(angle[p][j]),  sin likewise
+//
+// The second half of each row repeats the first -- that repetition is what
+// makes the rotation below a plain elementwise multiply.
+void rope_frequencies(int64_t seq_len, int64_t head_dim, float theta, Tensor& cos,
+                      Tensor& sin);
+
+// Applies the rotation in place to q and k:
+//
+//   out = x * cos + rotate_half(x) * sin
+//
+// q and k are [rows, seq, head_dim] with head_dim last and contiguous; `rows`
+// is batch*heads, and every row is rotated with the same table, which is what
+// the reference's `cos.unsqueeze(1)` broadcasts over. cos/sin are
+// [seq, head_dim] from rope_frequencies.
+//
+// NOTE on layout: the golden fixtures capture q/k as [1, heads, seq, head_dim],
+// so this contract matches the reference exactly. Callers holding
+// [seq, heads, head_dim] must transpose first -- a view, but this op (like every
+// other) requires contiguous input, so it is a real copy. At 98 KiB per tensor
+// per layer that is under 1% of a forward pass's memory traffic; fusing the
+// transpose into the rotation is a Phase 8 optimisation.
+void rope_apply(Tensor& q, Tensor& k, const Tensor& cos, const Tensor& sin);
+
 }  // namespace cpu
 }  // namespace llmrt

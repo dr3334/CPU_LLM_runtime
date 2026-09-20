@@ -27,6 +27,7 @@ add_library(llmrt_core STATIC
   src/model/weights.cpp
   src/ops/cpu/matmul.cpp
   src/ops/cpu/rmsnorm.cpp
+  src/ops/cpu/rope.cpp
   src/ops/cpu/swiglu.cpp
 )
 target_include_directories(llmrt_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")

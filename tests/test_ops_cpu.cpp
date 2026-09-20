@@ -691,4 +691,246 @@ LLMRT_TEST(swiglu_rejects_wrong_dtype) {
   CHECK_TRUE(threw);
 }
 
+// ---------------------------------------------------------------------------
+// rope -- half-split rotary position embedding
+//
+// NOTE: these fail against the unimplemented stubs in src/ops/cpu/rope.cpp.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The golden tables, flattened to [seq, head_dim].
+bool load_rope_tables(const golden::Store& g, std::vector<float>* cos, std::vector<float>* sin,
+                      int64_t* seq, int64_t* head_dim) {
+  const golden::Array* c = g.get("rope_cos");
+  const golden::Array* s = g.get("rope_sin");
+  if (c == nullptr || s == nullptr) return false;
+  *seq = c->shape[1];
+  *head_dim = c->shape[2];
+  *cos = c->f32;
+  *sin = s->f32;
+  return true;
+}
+
+}  // namespace
+
+LLMRT_TEST(rope_frequencies_match_golden) {
+  golden::Store g;
+  if (!g.available()) {
+    std::printf("      (skipped: fixtures missing)\n");
+    return;
+  }
+  std::vector<float> want_cos, want_sin;
+  int64_t seq = 0, head_dim = 0;
+  if (!load_rope_tables(g, &want_cos, &want_sin, &seq, &head_dim)) return;
+
+  std::vector<float> cos(want_cos.size()), sin(want_sin.size());
+  Tensor ct = view_of(cos, {seq, head_dim});
+  Tensor st = view_of(sin, {seq, head_dim});
+  cpu::rope_frequencies(seq, head_dim, 1e6f, ct, st);
+
+  const golden::Diff dc = golden::compare(cos.data(), want_cos.data(), cos.size());
+  const golden::Diff ds = golden::compare(sin.data(), want_sin.data(), sin.size());
+  std::printf("      rope_cos  %s\n", golden::diff_string(dc).c_str());
+  std::printf("      rope_sin  %s\n", golden::diff_string(ds).c_str());
+  CHECK_MSG(golden::within(dc), "rope cos: " + golden::diff_string(dc));
+  CHECK_MSG(golden::within(ds), "rope sin: " + golden::diff_string(ds));
+}
+
+// q has 16 heads and k has 8 (GQA), and both are rotated with the same table --
+// exactly the reference's apply_rotary_pos_emb(q, k, cos, sin). Rotating them in
+// one call is what makes a broadcast bug visible.
+LLMRT_TEST(rope_apply_matches_golden_q_and_k) {
+  golden::Store g;
+  if (!g.available()) return;
+  std::vector<float> cos, sin;
+  int64_t seq = 0, head_dim = 0;
+  if (!load_rope_tables(g, &cos, &sin, &seq, &head_dim)) return;
+
+  const golden::Array* q_in = g.get("rope_q_in");    // [1, 16, 12, 128]
+  const golden::Array* q_out = g.get("rope_q_out");
+  const golden::Array* k_in = g.get("rope_k_in");    // [1,  8, 12, 128]
+  const golden::Array* k_out = g.get("rope_k_out");
+  CHECK_TRUE(q_in != nullptr && q_out != nullptr && k_in != nullptr && k_out != nullptr);
+  if (q_in == nullptr || q_out == nullptr || k_in == nullptr || k_out == nullptr) return;
+
+  const int64_t q_heads = q_in->shape[1];
+  const int64_t k_heads = k_in->shape[1];
+
+  std::vector<float> q(q_in->f32), k(k_in->f32);  // in place, so work on copies
+  Tensor qt = view_of(q, {q_heads, seq, head_dim});
+  Tensor kt = view_of(k, {k_heads, seq, head_dim});
+  Tensor ct = view_of(cos, {seq, head_dim});
+  Tensor st = view_of(sin, {seq, head_dim});
+  cpu::rope_apply(qt, kt, ct, st);
+
+  const golden::Diff dq = golden::compare(q.data(), q_out->f(), q_out->numel());
+  const golden::Diff dk = golden::compare(k.data(), k_out->f(), k_out->numel());
+  std::printf("      rope q (16 heads)  %s\n", golden::diff_string(dq).c_str());
+  std::printf("      rope k ( 8 heads)  %s\n", golden::diff_string(dk).c_str());
+  CHECK_MSG(golden::within(dq), "rope q: " + golden::diff_string(dq));
+  CHECK_MSG(golden::within(dk), "rope k: " + golden::diff_string(dk));
+}
+
+// Isolates rope_apply from the table generator. Two cases, because the first
+// alone is passed by a no-op implementation:
+//   cos =  1, sin = 0  ->  out = x    (identity)
+//   cos = -1, sin = 0  ->  out = -x   (angle pi)
+LLMRT_TEST(rope_apply_identity_and_pi_rotations) {
+  const int64_t seq = 3, head_dim = 4;
+  const size_t n = static_cast<size_t>(seq * head_dim);
+
+  {
+    std::vector<float> x = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    const std::vector<float> before = x;
+    std::vector<float> k(n, 0.0f);
+    const std::vector<float> cos(n, 1.0f), sin(n, 0.0f);
+    Tensor xt = view_of(x, {1, seq, head_dim});
+    Tensor kt = view_of(k, {1, seq, head_dim});
+    Tensor ct = view_of(cos, {seq, head_dim});
+    Tensor st = view_of(sin, {seq, head_dim});
+    cpu::rope_apply(xt, kt, ct, st);
+    for (size_t i = 0; i < n; ++i) CHECK_NEAR(x[i], before[i], 1e-6);
+  }
+
+  {
+    std::vector<float> x = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    const std::vector<float> before = x;
+    std::vector<float> k(n, 0.0f);
+    const std::vector<float> cos(n, -1.0f), sin(n, 0.0f);
+    Tensor xt = view_of(x, {1, seq, head_dim});
+    Tensor kt = view_of(k, {1, seq, head_dim});
+    Tensor ct = view_of(cos, {seq, head_dim});
+    Tensor st = view_of(sin, {seq, head_dim});
+    cpu::rope_apply(xt, kt, ct, st);
+    for (size_t i = 0; i < n; ++i) CHECK_NEAR(x[i], -before[i], 1e-6);
+  }
+}
+
+// Pins the half-split convention independently of the table generator.
+//
+// With cos = 0 and sin = 1, out[j] = rotate_half(x)[j], i.e.
+//     j <  h :  out[j] = -x[j+h]
+//     j >= h :  out[j] =  x[j-h]
+// An interleaved implementation (pairing element 2j with 2j+1) applies a
+// different permutation and fails here.
+LLMRT_TEST(rope_apply_with_cosine_zero_reveals_the_pairing) {
+  const int64_t head_dim = 8, seq = 1;
+  std::vector<float> x = {1, 2, 3, 4, 5, 6, 7, 8};
+  std::vector<float> k(8, 0.0f);
+  const std::vector<float> cos(8, 0.0f), sin(8, 1.0f);
+
+  Tensor xt = view_of(x, {1, seq, head_dim});
+  Tensor kt = view_of(k, {1, seq, head_dim});
+  Tensor ct = view_of(cos, {seq, head_dim});
+  Tensor st = view_of(sin, {seq, head_dim});
+  cpu::rope_apply(xt, kt, ct, st);
+
+  // First half becomes the negated second half, and vice versa.
+  CHECK_NEAR(x[0], -5.0, 1e-6);
+  CHECK_NEAR(x[1], -6.0, 1e-6);
+  CHECK_NEAR(x[2], -7.0, 1e-6);
+  CHECK_NEAR(x[3], -8.0, 1e-6);
+  CHECK_NEAR(x[4], 1.0, 1e-6);
+  CHECK_NEAR(x[5], 2.0, 1e-6);
+  CHECK_NEAR(x[6], 3.0, 1e-6);
+  CHECK_NEAR(x[7], 4.0, 1e-6);
+}
+
+// Each (j, j+h) pair undergoes a 2-D rotation, so the pair's squared norm is
+// invariant. True for any table, so it catches sign and pairing errors even
+// when a golden comparison would absorb them.
+LLMRT_TEST(rope_apply_preserves_pair_norms) {
+  const int64_t rows = 2, seq = 3, head_dim = 8, half = head_dim / 2;
+  std::vector<float> x(static_cast<size_t>(rows * seq * head_dim));
+  for (size_t i = 0; i < x.size(); ++i) x[i] = 0.5f * static_cast<float>(i) - 5.0f;
+
+  // A real (non-degenerate) table, built here so this test does not depend on
+  // rope_frequencies being implemented.
+  std::vector<float> cos(static_cast<size_t>(seq * head_dim)), sin(cos.size());
+  for (int64_t p = 0; p < seq; ++p) {
+    for (int64_t j = 0; j < head_dim; ++j) {
+      const float angle = 0.7f * static_cast<float>(p) + 1.1f * static_cast<float>(j);
+      cos[static_cast<size_t>(p * head_dim + j)] = std::cos(angle);
+      sin[static_cast<size_t>(p * head_dim + j)] = std::sin(angle);
+    }
+  }
+
+  std::vector<float> k(x.size(), 0.0f);
+  Tensor xt = view_of(x, {rows, seq, head_dim});
+  Tensor kt = view_of(k, {rows, seq, head_dim});
+  Tensor ct = view_of(cos, {seq, head_dim});
+  Tensor st = view_of(sin, {seq, head_dim});
+
+  std::vector<float> before = x;
+  cpu::rope_apply(xt, kt, ct, st);
+
+  // A no-op implementation preserves norms trivially, so require that the data
+  // actually changed before trusting the invariant.
+  bool changed = false;
+  for (size_t i = 0; i < x.size(); ++i) {
+    if (x[i] != before[i]) changed = true;
+  }
+  CHECK_MSG(changed, "output equals input -- the implementation is a no-op");
+
+  for (int64_t r = 0; r < rows; ++r) {
+    for (int64_t p = 0; p < seq; ++p) {
+      for (int64_t j = 0; j < half; ++j) {
+        const size_t a = static_cast<size_t>((r * seq + p) * head_dim + j);
+        const size_t b = static_cast<size_t>((r * seq + p) * head_dim + j + half);
+        const double n_before = static_cast<double>(before[a]) * before[a] +
+                                static_cast<double>(before[b]) * before[b];
+        const double n_after =
+            static_cast<double>(x[a]) * x[a] + static_cast<double>(x[b]) * x[b];
+        CHECK_NEAR(n_after, n_before, 1e-4);
+      }
+    }
+  }
+}
+
+LLMRT_TEST(rope_apply_rejects_head_dim_mismatch) {
+  std::vector<float> q(2 * 3 * 4, 1.0f), k(2 * 3 * 4, 1.0f);
+  const std::vector<float> cos(2 * 8, 1.0f), sin(2 * 8, 0.0f);  // head_dim 8 != 4
+  Tensor qt = view_of(q, {2, 3, 4});
+  Tensor kt = view_of(k, {2, 3, 4});
+  Tensor ct = view_of(cos, {2, 8});
+  Tensor st = view_of(sin, {2, 8});
+  bool threw = false;
+  try {
+    cpu::rope_apply(qt, kt, ct, st);
+  } catch (const Error&) {
+    threw = true;
+  }
+  CHECK_TRUE(threw);
+}
+
+LLMRT_TEST(rope_apply_rejects_seq_mismatch) {
+  std::vector<float> q(2 * 3 * 4, 1.0f), k(2 * 3 * 4, 1.0f);
+  const std::vector<float> cos(5 * 4, 1.0f), sin(5 * 4, 0.0f);  // seq 5 != 3
+  Tensor qt = view_of(q, {2, 3, 4});
+  Tensor kt = view_of(k, {2, 3, 4});
+  Tensor ct = view_of(cos, {5, 4});
+  Tensor st = view_of(sin, {5, 4});
+  bool threw = false;
+  try {
+    cpu::rope_apply(qt, kt, ct, st);
+  } catch (const Error&) {
+    threw = true;
+  }
+  CHECK_TRUE(threw);
+}
+
+LLMRT_TEST(rope_frequencies_rejects_odd_head_dim) {
+  std::vector<float> cos(12, 0.0f), sin(12, 0.0f);
+  Tensor ct = view_of(cos, {2, 6});
+  Tensor st = view_of(sin, {2, 6});
+  bool threw = false;
+  try {
+    cpu::rope_frequencies(2, 6, 1e6f, ct, st);  // half-split needs an even head_dim
+  } catch (const Error&) {
+    threw = true;
+  }
+  CHECK_TRUE(threw);
+}
+
 int main() { return llmrt_test::run_all("ops_cpu"); }
