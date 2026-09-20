@@ -542,4 +542,153 @@ LLMRT_TEST(matmul_rejects_strided_input) {
   CHECK_TRUE(threw);
 }
 
+// ---------------------------------------------------------------------------
+// swiglu -- out[i] = silu(gate[i]) * up[i]
+//
+// NOTE: these fail against the unimplemented stub in src/ops/cpu/swiglu.cpp.
+// They are the target to code against.
+// ---------------------------------------------------------------------------
+
+LLMRT_TEST(swiglu_matches_golden) {
+  golden::Store g;
+  if (!g.available()) {
+    std::printf("      (skipped: fixtures missing)\n");
+    return;
+  }
+  const golden::Array* gate = g.get("gate_proj_out");  // [1, 12, 3072]
+  const golden::Array* up = g.get("up_proj_out");      // [1, 12, 3072]
+  const golden::Array* want = g.get("swiglu_out");     // [1, 12, 3072]
+  CHECK_TRUE(gate != nullptr && up != nullptr && want != nullptr);
+  if (gate == nullptr || up == nullptr || want == nullptr) return;
+  CHECK_TRUE(gate->shape == up->shape);
+  CHECK_TRUE(gate->shape == want->shape);
+
+  std::vector<float> out(gate->numel());
+  Tensor gt = view_of(gate->f32, gate->shape);
+  Tensor ut = view_of(up->f32, up->shape);
+  Tensor ot = view_of(out, want->shape);
+  cpu::swiglu(gt, ut, ot);
+
+  const golden::Diff d = golden::compare(out.data(), want->f(), want->numel());
+  std::printf("      swiglu  %s\n", golden::diff_string(d).c_str());
+  CHECK_MSG(golden::within(d), "swiglu: " + golden::diff_string(d));
+}
+
+// This one does not call the op at all: swiglu_out and down_proj_in were
+// captured from two different hooks and must be the same tensor, so a
+// disagreement would mean the fixtures themselves are broken.
+LLMRT_TEST(swiglu_fixtures_swiglu_out_and_down_proj_in_agree) {
+  golden::Store g;
+  if (!g.available()) return;
+  const golden::Array* a = g.get("swiglu_out");
+  const golden::Array* b = g.get("down_proj_in");
+  CHECK_TRUE(a != nullptr && b != nullptr);
+  if (a == nullptr || b == nullptr) return;
+
+  CHECK_EQ(a->numel(), b->numel());
+  CHECK_EQ(std::memcmp(a->f32.data(), b->f32.data(), a->numel() * sizeof(float)), 0);
+}
+
+LLMRT_TEST(swiglu_hand_computed_values) {
+  // silu(0) = 0, silu(1) = 1/(1+e^-1), silu(-1) = -1/(1+e^1)
+  const std::vector<float> gate = {0.0f, 1.0f, -1.0f};
+  const std::vector<float> up = {1.0f, 1.0f, 1.0f};
+  std::vector<float> out(3);
+  Tensor gt = view_of(gate, {3});
+  Tensor ut = view_of(up, {3});
+  Tensor ot = view_of(out, {3});
+  cpu::swiglu(gt, ut, ot);
+
+  CHECK_NEAR(out[0], 0.0, 1e-6);
+  CHECK_NEAR(out[1], 0.7310586, 1e-6);
+  CHECK_NEAR(out[2], -0.2689414, 1e-6);
+}
+
+LLMRT_TEST(swiglu_handles_negative_gate_without_overflow) {
+  // Large negative gate: exp(-x) overflows to +inf, and x/(1+inf) must give a
+  // clean 0 rather than NaN. Large positive must saturate to x itself.
+  const std::vector<float> gate = {-100.0f, 100.0f};
+  const std::vector<float> up = {1.0f, 1.0f};
+  std::vector<float> out(2);
+  Tensor gt = view_of(gate, {2});
+  Tensor ut = view_of(up, {2});
+  Tensor ot = view_of(out, {2});
+  cpu::swiglu(gt, ut, ot);
+
+  CHECK_TRUE(out[0] == out[0]);  // not NaN
+  CHECK_NEAR(out[0], 0.0, 1e-6);
+  CHECK_NEAR(out[1], 100.0, 1e-3);
+}
+
+LLMRT_TEST(swiglu_is_linear_in_up) {
+  // out = silu(gate) * up, so scaling up scales out by the same factor.
+  std::vector<float> gate(16), up(16), up2(16);
+  for (size_t i = 0; i < gate.size(); ++i) {
+    gate[i] = static_cast<float>(i) - 8.0f;
+    up[i] = 0.5f + 0.1f * static_cast<float>(i);
+    up2[i] = 3.0f * up[i];
+  }
+  std::vector<float> o1(16), o2(16);
+  Tensor gt = view_of(gate, {16});
+  Tensor ut1 = view_of(up, {16});
+  Tensor ut2 = view_of(up2, {16});
+  Tensor ot1 = view_of(o1, {16});
+  Tensor ot2 = view_of(o2, {16});
+  cpu::swiglu(gt, ut1, ot1);
+  cpu::swiglu(gt, ut2, ot2);
+
+  // Without this, a no-op implementation would "pass": it writes zeros both
+  // times, and 0 == 3*0.
+  bool any_nonzero = false;
+  for (const float v : o1) {
+    if (v != 0.0f) any_nonzero = true;
+  }
+  CHECK_MSG(any_nonzero, "output is all zeros -- the implementation is a no-op");
+
+  for (size_t i = 0; i < o1.size(); ++i) CHECK_NEAR(o2[i], 3.0 * o1[i], 1e-5);
+}
+
+LLMRT_TEST(swiglu_rejects_shape_mismatch) {
+  std::vector<float> gate(6, 1.0f), up(4, 1.0f), out(6, 0.0f);
+  Tensor gt = view_of(gate, {2, 3});
+  Tensor ut = view_of(up, {2, 2});
+  Tensor ot = view_of(out, {2, 3});
+  bool threw = false;
+  try {
+    cpu::swiglu(gt, ut, ot);
+  } catch (const Error&) {
+    threw = true;
+  }
+  CHECK_TRUE(threw);
+}
+
+LLMRT_TEST(swiglu_rejects_non_contiguous) {
+  std::vector<float> gate(6, 1.0f), up(6, 1.0f), out(6, 0.0f);
+  Tensor gt = view_of(gate, {2, 3}).transpose(0, 1);  // strided, [3, 2]
+  Tensor ut = view_of(up, {2, 3});
+  Tensor ot = view_of(out, {2, 3});
+  bool threw = false;
+  try {
+    cpu::swiglu(gt, ut, ot);
+  } catch (const Error& e) {
+    threw = true;
+    CHECK_MSG(std::string(e.what()).find("swiglu") != std::string::npos, e.what());
+  }
+  CHECK_TRUE(threw);
+}
+
+LLMRT_TEST(swiglu_rejects_wrong_dtype) {
+  std::vector<float> gate(6, 1.0f), up(6, 1.0f), out(6, 0.0f);
+  Tensor gt = Tensor::contiguous(gate.data(), DType::BF16, DeviceKind::CPU, {2, 3});
+  Tensor ut = view_of(up, {2, 3});
+  Tensor ot = view_of(out, {2, 3});
+  bool threw = false;
+  try {
+    cpu::swiglu(gt, ut, ot);
+  } catch (const Error&) {
+    threw = true;
+  }
+  CHECK_TRUE(threw);
+}
+
 int main() { return llmrt_test::run_all("ops_cpu"); }

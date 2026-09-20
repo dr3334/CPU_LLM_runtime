@@ -49,5 +49,19 @@ void rmsnorm(const Tensor& x, const Tensor& weight, Tensor& out, float eps);
 // loop becomes a dot product between two contiguous rows.
 void matmul(const Tensor& a, const Tensor& b, Tensor& out, bool transpose_b);
 
+// SwiGLU: the gated MLP activation, applied elementwise.
+//
+//   out[i] = silu(gate[i]) * up[i],   where silu(x) = x / (1 + exp(-x))
+//
+// Qwen3MLP computes down_proj(silu(gate_proj(x)) * up_proj(x)), so this op is
+// where the two parallel projections are combined. `gate`, `up` and `out` must
+// have identical shapes; the op is purely elementwise, so there is no axis or
+// reduction parameter.
+//
+// The 1/(1+exp(-x)) form is what torch's SiLU uses -- verified bit-exact
+// against ACT2FN["silu"]. Writing x * sigmoid(x) instead differs in the last
+// bits, so it is not used here.
+void swiglu(const Tensor& gate, const Tensor& up, Tensor& out);
+
 }  // namespace cpu
 }  // namespace llmrt

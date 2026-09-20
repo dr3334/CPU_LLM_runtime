@@ -124,6 +124,42 @@ they are all confirmed against `modeling_qwen3.py`:
 - **BF16 -> F32 is exact** (bf16 is the upper 16 bits of f32), so the loader
   introduces no error. All arithmetic is fp32.
 
+### Floating-point rules
+
+The goal is **not** to compute the most accurate value. It is to reproduce the
+reference implementation's value. Those are different goals, and chasing
+accuracy can move the result *away* from the golden. Every rule below comes
+from a case that actually bit us.
+
+| Trap | What goes wrong | Fix |
+|---|---|---|
+| Operator grouping | `u*g/d` parses as `(u*g)/d`, but the formula is `u*(g/d)`. `*` and `/` share a precedence level and are left-associative. | Copy the reference expression and add parentheses liberally. Extra parens cost nothing. |
+| Literal type | `1.0 + std::exp(-g)` promotes the whole expression to `double` | Write `1.0f` / `0.0f`. |
+| Approximate intrinsics | `_mm_rsqrt_ps` etc. differ in the last bits | Use exact `<cmath>` functions, i.e. `1/sqrt(x)`, never a hardware rsqrt. |
+| Accumulator width | fp32 summing 1024 terms drifts | Match the reference first, widen only if the margin is thin. Measured for rmsnorm's sum of squares: fp32 -> rel 1.13e-06, double -> 4.69e-08. |
+| **Compiler contraction** | The compiler may fuse `a*b + c` into a single FMA, turning two roundings into one. | `-ffp-contract` is **on by default** in GCC/Clang, so today's `matmul` inner loop is probably FMA-contracted. Results can then shift with compiler, flags or target. Add `-ffp-contract=off` if bit-stability across machines is ever required. |
+| Overflow | `(u*g)/d` reaches `inf` where `u*(g/d)` does not (e.g. `g=-49.4`, `u=1e37`; the true value is representable) | Watch the magnitude of intermediates; prefer the grouping that is also safer. |
+
+Two worked examples from this repo:
+
+- **silu**: `x / (1 + exp(-x))` matches torch bit-for-bit, while the tidier
+  `x * sigmoid(x)` differs by ~2.4e-7. The mathematically nicer form is the
+  wrong one.
+- **swiglu**: rewriting the loop from `(u*g)/d` to `u*(g/d)` — identical in real
+  arithmetic — cut the error against golden from 2 ulp to 1 ulp.
+
+**The only reliable check is measurement.** Write the variant, run it against
+the golden, compare `rel` with the tolerance in `tests/golden.h`:
+
+```
+rel < tol * 0.01   comfortable
+rel < tol * 0.1    acceptable
+rel > tol * 0.5    fragile -- find another formulation
+```
+
+Current margins: rmsnorm 88x, matmul 79x, swiglu 3500x (purely elementwise, so
+`exp` is its only error source).
+
 ## Layout
 
 ```
