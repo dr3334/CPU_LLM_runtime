@@ -32,6 +32,7 @@
 #include "llmrt/ops.h"
 
 #include <cmath>
+#include <vector>
 
 #include "llmrt/common.h"
 
@@ -40,39 +41,122 @@ namespace cpu {
 
 namespace {
 
-// TODO(你): 参数校验。
-//
-// 需要检查：
-//   seq_len > 0
-//   head_dim > 0 且 head_dim % 2 == 0      （半拆分要求能对半分）
-//   theta > 0
-//   cos / sin：连续、f32、在 CPU、形状都是 [seq_len, head_dim]
-//
-// 可以仿照前面两个算子（rmsnorm.cpp / swiglu.cpp）的 check_*_args 写法。
+// ---------------------------------------------------------------------------
+// Argument checks
+// ---------------------------------------------------------------------------
+
 void check_rope_frequencies_args(int64_t seq_len, int64_t head_dim, float theta,
                                  const Tensor& cos, const Tensor& sin) {
-  (void)seq_len;
-  (void)head_dim;
-  (void)theta;
-  (void)cos;
-  (void)sin;
+  LLMRT_CHECK(seq_len > 0, "rope_frequencies: seq_len must be positive");
+  LLMRT_CHECK(head_dim > 0, "rope_frequencies: head_dim must be positive");
+  // The half-split convention folds the axis in two, so an odd head_dim has no
+  // valid rotation.
+  LLMRT_CHECK(head_dim % 2 == 0, "rope_frequencies: head_dim must be even, got " +
+                                     std::to_string(head_dim));
+  LLMRT_CHECK(theta > 0.0f, "rope_frequencies: theta must be positive");
+
+  cos.require_contiguous("rope_frequencies");
+  sin.require_contiguous("rope_frequencies");
+  LLMRT_CHECK(cos.is_cpu() && sin.is_cpu(),
+              "rope_frequencies: cos and sin must be host (CPU) tensors");
+  LLMRT_CHECK(cos.dtype == DType::F32 && sin.dtype == DType::F32,
+              "rope_frequencies: cos and sin must be F32");
+
+  const std::vector<int64_t> want = {seq_len, head_dim};
+  LLMRT_CHECK(cos.shape == want && sin.shape == want,
+              "rope_frequencies: cos and sin must both be [seq_len, head_dim] = [" +
+                  std::to_string(seq_len) + ", " + std::to_string(head_dim) + "], got " +
+                  cos.shape_string() + " and " + sin.shape_string());
 }
 
-// TODO(你): 参数校验。
-//
-// 需要检查：
-//   q / k：连续、f32、在 CPU、rank >= 2
-//   cos / sin：连续、f32、在 CPU、形状相同且为 [seq, head_dim]
-//   q 和 k 的最后一维 == cos 的最后一维 (head_dim)
-//   q 和 k 的倒数第二维 == cos 的倒数第二维 (seq)
-//     ← 注意 q/k 是 [rows, seq, head_dim]，seq 在 **倒数第二维**
-//   q 和 k 的 seq/head_dim 必须一致（虽然 heads 数可以不同：GQA 16 vs 8）
 void check_rope_apply_args(const Tensor& q, const Tensor& k, const Tensor& cos,
                            const Tensor& sin) {
-  (void)q;
-  (void)k;
-  (void)cos;
-  (void)sin;
+  q.require_contiguous("rope_apply");
+  k.require_contiguous("rope_apply");
+  cos.require_contiguous("rope_apply");
+  sin.require_contiguous("rope_apply");
+
+  LLMRT_CHECK(q.is_cpu() && k.is_cpu() && cos.is_cpu() && sin.is_cpu(),
+              "rope_apply: all tensors must be host (CPU) tensors");
+  LLMRT_CHECK(q.dtype == DType::F32 && k.dtype == DType::F32 && cos.dtype == DType::F32 &&
+                  sin.dtype == DType::F32,
+              "rope_apply: all tensors must be F32");
+
+  LLMRT_CHECK(q.rank() >= 2 && k.rank() >= 2,
+              "rope_apply: q and k must be at least 2-D [.., seq, head_dim], got " +
+                  q.shape_string() + " and " + k.shape_string());
+  LLMRT_CHECK(cos.rank() == 2,
+              "rope_apply: cos/sin must be 2-D [seq, head_dim], got " + cos.shape_string());
+  LLMRT_CHECK(cos.shape == sin.shape,
+              "rope_apply: cos and sin must have the same shape, got " + cos.shape_string() +
+                  " and " + sin.shape_string());
+
+  // Only the last two axes of q/k must agree with the table. The leading axes
+  // are batch and head, and q and k are allowed to differ there: GQA gives q 16
+  // heads against k's 8. That is why they are rotated by separate calls below.
+  const int64_t seq = cos.dim(0);
+  const int64_t head_dim = cos.dim(1);
+  LLMRT_CHECK(head_dim % 2 == 0,
+              "rope_apply: head_dim must be even, got " + std::to_string(head_dim));
+  LLMRT_CHECK(q.dim(q.rank() - 2) == seq && q.dim(q.rank() - 1) == head_dim,
+              "rope_apply: q is " + q.shape_string() +
+                  " but must end in [seq, head_dim] = [" + std::to_string(seq) + ", " +
+                  std::to_string(head_dim) + "]");
+  LLMRT_CHECK(k.dim(k.rank() - 2) == seq && k.dim(k.rank() - 1) == head_dim,
+              "rope_apply: k is " + k.shape_string() +
+                  " but must end in [seq, head_dim] = [" + std::to_string(seq) + ", " +
+                  std::to_string(head_dim) + "]");
+}
+
+// ---------------------------------------------------------------------------
+// Rotation
+// ---------------------------------------------------------------------------
+
+// Rotates one tensor in place. `x` ends in [seq, head_dim], contiguous.
+//
+// A separate function rather than one loop covering both q and k, because under
+// GQA they have different row counts. A single loop driven by q's row count
+// would write past the end of k's buffer -- silently, since nothing checks.
+//
+// cos_base / sin_base are [seq, head_dim] and are shared by every row, which is
+// exactly the reference's `cos.unsqueeze(1)` broadcast over the head axis.
+void rope_apply_one(Tensor& x, const float* cos_base, const float* sin_base) {
+  // Taken from the END of the shape, so any number of leading batch/head axes
+  // works: they all just become "rows".
+  const int64_t head_dim = x.dim(x.rank() - 1);
+  const int64_t seq = x.dim(x.rank() - 2);
+  const int64_t rows =
+      static_cast<int64_t>(x.numel() / static_cast<size_t>(seq) / static_cast<size_t>(head_dim));
+  const int64_t half = head_dim / 2;
+
+  float* base = x.f32();
+
+  for (int64_t r = 0; r < rows; ++r) {
+    for (int64_t p = 0; p < seq; ++p) {
+      // Computed once and reused four times below. Spelling the full index
+      // expression out at each use is how off-by-one slips stay invisible.
+      const int64_t x_row = (r * seq + p) * head_dim;
+      // The table has no row axis, so its offset stops at the position.
+      const int64_t angle_row = p * head_dim;
+
+      for (int64_t j = 0; j < half; ++j) {
+        // Either output element needs BOTH inputs, so read both before writing
+        // either. Writing element by element in increasing j order would
+        // clobber x[j] before the second assignment reads it.
+        const float lo = base[x_row + j];
+        const float hi = base[x_row + j + half];
+
+        // The four products are:
+        //   lo * cos[j]      the element's own cosine term
+        //   hi * sin[j]      the partner's sine term, negated (front half)
+        //   hi * cos[j+h]    the partner's own cosine term
+        //   lo * sin[j+h]    the element's sine term (back half)
+        base[x_row + j] = lo * cos_base[angle_row + j] - hi * sin_base[angle_row + j];
+        base[x_row + j + half] =
+            hi * cos_base[angle_row + j + half] + lo * sin_base[angle_row + j + half];
+      }
+    }
+  }
 }
 
 }  // namespace
@@ -81,93 +165,47 @@ void rope_frequencies(int64_t seq_len, int64_t head_dim, float theta, Tensor& co
                       Tensor& sin) {
   check_rope_frequencies_args(seq_len, head_dim, theta, cos, sin);
 
-  // TODO(你): 生成 cos/sin 表 [seq_len, head_dim]
-  //
-  // 公式（已用 check_oracle.py 对过 golden，rel ~5e-7）：
-  //
-  //   half    = head_dim / 2
-  //   inv_freq[i] = 1 / theta^( 2i / head_dim )        i 取 [0, half)
-  //   angle[p][j] = p * inv_freq[j % half]             ← j % half：前后半段同频
-  //   cos[p][j]   = cos( angle[p][j] )
-  //   sin[p][j]   = sin( angle[p][j] )
-  //
-  // 提示：
-  //   - inv_freq 只有 half 个值，**先算一遍存下来**再用。
-  //     直接在 j 循环里算 powf 会把同一个值重算 head_dim 倍。
-  //   - 用 float 全程：1.0f / std::pow(theta, ...)、std::cos(...)、std::sin(...)
-  //   - 行主序：[p][j] 的线性下标是 p * head_dim + j
-  //   - 这是整个模型里唯一会调用超越函数的地方之一，prefill 时 seq 可能到几百，
-  //     而这个表每个 forward 只算一次、28 层共用 —— 这正是把它拆成独立函数的原因
-  const int64_t half =head_dim/2;
+  const int64_t half = head_dim / 2;
+
+  // f32() hands back the data pointer and validates dtype/device on the way, so
+  // a wrong tensor is rejected before a single element is written.
+  float* cos_base = cos.f32();
+  float* sin_base = sin.f32();
+
+  // Only `half` distinct frequencies exist and each is reused by every
+  // position, so hoist the pow() out of the element loop -- otherwise it is
+  // recomputed head_dim/2 extra times per position.
   std::vector<float> inv_freq(static_cast<size_t>(half));
-  
-  for(int64_t i=0;i<half;i++){
-    inv_freq[i] = 1.0f / std::pow(theta, 2.0f * i / head_dim);
+  for (int64_t i = 0; i < half; ++i) {
+    // Matches the reference's `1 / base ** (2i / dim)` exactly. The f-suffixed
+    // literals keep the expression in float; a bare 2.0 would promote it to
+    // double and round differently from the reference.
+    inv_freq[static_cast<size_t>(i)] = 1.0f / std::pow(theta, 2.0f * i / head_dim);
   }
-  for(int64_t p=0;p<seq_len;p++){
-    for(int64_t j=0;j<head_dim;j++){
-      float angle = p * inv_freq[j % half];
-      cos[p * head_dim + j] = std::cos(angle);
-      sin[p * head_dim + j] = std::sin(angle);
+
+  for (int64_t p = 0; p < seq_len; ++p) {
+    for (int64_t j = 0; j < head_dim; ++j) {
+      // `j % half` is what makes the second half of a row repeat the first.
+      // That repetition is why the half-split rotation collapses into a plain
+      // elementwise multiply: element j and element j+half carry the same
+      // angle, so a single cos/sin pair serves both.
+      const float angle = static_cast<float>(p) * inv_freq[static_cast<size_t>(j % half)];
+      cos_base[p * head_dim + j] = std::cos(angle);
+      sin_base[p * head_dim + j] = std::sin(angle);
     }
   }
-  
 }
 
 void rope_apply(Tensor& q, Tensor& k, const Tensor& cos, const Tensor& sin) {
   check_rope_apply_args(q, k, cos, sin);
 
-  // TODO(你): 对 q 和 k 施加旋转（原地修改）
-  //
-  // q / k 形状 [rows, seq, head_dim]，cos/sin 形状 [seq, head_dim]。
-  // 每一行（row）独立旋转，但**所有 row 共用同一张 cos/sin 表** ——
-  // 这正是参考实现里 cos.unsqueeze(1) 沿 heads 维广播的含义。
-  //
-  // 元素级公式（d = head_dim，h = d/2，p = 位置，j = 维内下标）：
-  //
-  //   out[j]   = x[j] * cos[j] - x[j+h] * sin[j]        j <  h
-  //   out[j+h] = x[j+h] * cos[j+h] + x[j] * sin[j+h]    后半段同理
-  //
-  // ⚠️ 原地修改有别名陷阱：out[j] 和 out[j+h] **互相需要对方的原值**。
-  //    如果按 j = 0,1,2,... 顺序逐个写：
-  //      写到 j 时，x[j] 被覆盖
-  //      写到 j+h 时，公式需要 x[j] —— 但它已经被覆盖成 out[j] 了 ❌
-  //
-  //    正确做法：**每次成对处理** (j, j+h)，先把两个原值读进局部变量，
-  //    再一次性写回两个位置。一趟循环，无别名问题。
-  //
-  //    即：for (j = 0; j < h; ++j) { a = x[j]; b = x[j+h]; ...; x[j] = ...; x[j+h] = ...; }
-  //
-  // 提示：
-  //   - 三层循环：row → p → j，其中 j 只走到 half 就够（一次处理一对）
-  //   - q 和 k 的行数不同（16 vs 8），所以 q、k 要各自循环
-  //   - 建议先写一个只处理单个张量的内部辅助函数，q 和 k 各调一次
-  float q_base=q.f32();
-  float k_base=k.f32();
-  int64_t rows_q=q.dim(0);
-  int64_t rows_k=k.dim(0);
-  int64_t seq=q.dim(1);
-  int64_t head_dim=q.dim(2);
-  int64_t half=head_dim/2;
-  for(int64_t r=0;r<rows_q;r++){
-    for(int64_t p=0;p<seq;p++){
-      for(int64_t j=0;j<half;j++){
-        float q_j=q_base[r*seq*head_dim+p*head_dim+j];
-        float q_jh=q_base[r*seq*head_dim+p*head_dim+j+
-half];
-        float k_j=k_base[r*seq*head_dim+p*head_dim+j];
-        float k_jh=k_base[r*seq*head_dim+p*head_dim+j+half];
-        q_base[r*seq*head_dim+p*head_dim+j]=q_j*cos[p*head_dim+j]-q_jh*sin[p*head_dim+j];
-        q_base[r*seq*head_dim+p*head_dim+j+half]=q_jh*cos[p*head
-_dim+j+half]+q_j*sin[p*head_dim+j+half];
-        k_base[r*seq*head_dim+p*head_dim+j]=k_j*cos[p*head_dim+j]-k_jh*sin[p*head_dim+j];
-        k_base[r*seq*head_dim+p*head_dim+j+half]=k_jh*cos[p*head_dim+j+half]+k_j*sin[p*head_dim+j+half];
-      }
-  }
-}
-  (void)k;
-  (void)cos;
-  (void)sin;
+  const float* cos_base = cos.f32();
+  const float* sin_base = sin.f32();
+
+  // Two calls rather than one shared loop: q and k have different head counts
+  // under GQA (16 vs 8 here) and each must index only its own rows.
+  rope_apply_one(q, cos_base, sin_base);
+  rope_apply_one(k, cos_base, sin_base);
 }
 
 }  // namespace cpu

@@ -840,17 +840,25 @@ LLMRT_TEST(rope_apply_with_cosine_zero_reveals_the_pairing) {
 // Each (j, j+h) pair undergoes a 2-D rotation, so the pair's squared norm is
 // invariant. True for any table, so it catches sign and pairing errors even
 // when a golden comparison would absorb them.
+//
+// NOTE: the invariance holds because RoPE gives element j and element j+h the
+// SAME angle (see the j % half in rope_frequencies). A table with independent
+// per-element angles would not preserve the norm -- that is a property of the
+// construction, not of the loop. The table built here therefore mimics the real
+// one rather than using arbitrary angles.
 LLMRT_TEST(rope_apply_preserves_pair_norms) {
   const int64_t rows = 2, seq = 3, head_dim = 8, half = head_dim / 2;
   std::vector<float> x(static_cast<size_t>(rows * seq * head_dim));
   for (size_t i = 0; i < x.size(); ++i) x[i] = 0.5f * static_cast<float>(i) - 5.0f;
 
-  // A real (non-degenerate) table, built here so this test does not depend on
-  // rope_frequencies being implemented.
+  std::vector<float> inv_freq(static_cast<size_t>(half));
+  for (int64_t i = 0; i < half; ++i) {
+    inv_freq[static_cast<size_t>(i)] = 1.0f / std::pow(1e6f, 2.0f * i / head_dim);
+  }
   std::vector<float> cos(static_cast<size_t>(seq * head_dim)), sin(cos.size());
   for (int64_t p = 0; p < seq; ++p) {
     for (int64_t j = 0; j < head_dim; ++j) {
-      const float angle = 0.7f * static_cast<float>(p) + 1.1f * static_cast<float>(j);
+      const float angle = static_cast<float>(p) * inv_freq[static_cast<size_t>(j % half)];
       cos[static_cast<size_t>(p * head_dim + j)] = std::cos(angle);
       sin[static_cast<size_t>(p * head_dim + j)] = std::sin(angle);
     }
@@ -921,12 +929,12 @@ LLMRT_TEST(rope_apply_rejects_seq_mismatch) {
 }
 
 LLMRT_TEST(rope_frequencies_rejects_odd_head_dim) {
-  std::vector<float> cos(12, 0.0f), sin(12, 0.0f);
-  Tensor ct = view_of(cos, {2, 6});
-  Tensor st = view_of(sin, {2, 6});
+  std::vector<float> cos(10, 0.0f), sin(10, 0.0f);
+  Tensor ct = view_of(cos, {2, 5});
+  Tensor st = view_of(sin, {2, 5});
   bool threw = false;
   try {
-    cpu::rope_frequencies(2, 6, 1e6f, ct, st);  // half-split needs an even head_dim
+    cpu::rope_frequencies(2, 5, 1e6f, ct, st);  // half-split needs an even head_dim
   } catch (const Error&) {
     threw = true;
   }
