@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -935,6 +936,183 @@ LLMRT_TEST(rope_frequencies_rejects_odd_head_dim) {
   bool threw = false;
   try {
     cpu::rope_frequencies(2, 5, 1e6f, ct, st);  // half-split needs an even head_dim
+  } catch (const Error&) {
+    threw = true;
+  }
+  CHECK_TRUE(threw);
+}
+
+// ---------------------------------------------------------------------------
+// softmax -- stable softmax over the last axis
+//
+// NOTE: these fail against the unimplemented stub in src/ops/cpu/softmax.cpp.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<float> run_softmax(const std::vector<float>& x,
+                               const std::vector<int64_t>& shape) {
+  std::vector<float> out(x.size());
+  Tensor xt = view_of(x, shape);
+  Tensor ot = view_of(out, shape);
+  cpu::softmax(xt, ot);
+  return out;
+}
+
+}  // namespace
+
+// Reference values produced by
+//   torch.nn.functional.softmax(x, dim=-1, dtype=torch.float32)
+// which is exactly how Qwen3's attention calls it. Rows 0 and 1 differ by a
+// constant shift and must give identical output -- softmax is shift invariant,
+// so this single table checks both the values and that property.
+LLMRT_TEST(softmax_matches_torch_reference_values) {
+  const std::vector<float> x = {1.0f,  2.0f,  3.0f,     // -> same as next row
+                                -1.0f, 0.0f,  1.0f,
+                                0.5f,  -0.5f, 0.25f};
+  const std::vector<float> want = {0.09003057330846786f, 0.2447284758090973f,
+                                   0.6652409434318542f,
+                                   0.09003057330846786f, 0.2447284758090973f,
+                                   0.6652409434318542f,
+                                   0.4658356010913849f,  0.17137134075164795f,
+                                   0.36279311776161194f};
+
+  const std::vector<float> out = run_softmax(x, {3, 3});
+  for (size_t i = 0; i < want.size(); ++i) {
+    CHECK_NEAR(out[i], want[i], 1e-7);
+  }
+}
+
+LLMRT_TEST(softmax_rows_sum_to_one) {
+  std::vector<float> x(static_cast<size_t>(4 * 7));
+  for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(static_cast<float>(i) * 1.3f) * 5.0f;
+
+  const std::vector<float> out = run_softmax(x, {4, 7});
+  for (int r = 0; r < 4; ++r) {
+    double sum = 0.0;
+    for (int j = 0; j < 7; ++j) {
+      const float v = out[static_cast<size_t>(r * 7 + j)];
+      CHECK_MSG(v >= 0.0f && v <= 1.0f, "softmax produced a value outside [0,1]");
+      sum += static_cast<double>(v);
+    }
+    CHECK_NEAR(sum, 1.0, 1e-6);
+  }
+}
+
+LLMRT_TEST(softmax_is_shift_invariant) {
+  // softmax(x + c) == softmax(x) for any constant c. This is the property that
+  // makes subtracting the row max free.
+  std::vector<float> a(12), b(12);
+  for (size_t i = 0; i < a.size(); ++i) {
+    a[i] = 0.3f * static_cast<float>(i) - 2.0f;
+    b[i] = a[i] + 7.5f;
+  }
+  const std::vector<float> oa = run_softmax(a, {3, 4});
+  const std::vector<float> ob = run_softmax(b, {3, 4});
+
+  // A no-op implementation writes zeros to both and would "pass" the
+  // comparison below, so check the output is a real distribution first.
+  double sum = 0.0;
+  for (const float v : oa) sum += static_cast<double>(v);
+  CHECK_MSG(std::fabs(sum - 3.0) < 1e-5, "rows do not sum to 1 -- implementation is a no-op");
+
+  for (size_t i = 0; i < oa.size(); ++i) CHECK_NEAR(ob[i], oa[i], 1e-6);
+}
+
+// The test that pins max subtraction. Without it exp(90) overflows to inf, the
+// row becomes [0, nan, nan], and this fails.
+LLMRT_TEST(softmax_survives_inputs_that_overflow_a_naive_exp) {
+  const std::vector<float> big = {88.0f, 89.0f, 90.0f};
+  const std::vector<float> small = {1.0f, 2.0f, 3.0f};
+
+  const std::vector<float> out_big = run_softmax(big, {1, 3});
+  const std::vector<float> out_small = run_softmax(small, {1, 3});
+
+  for (float v : out_big) CHECK_MSG(v == v, "softmax produced NaN on large input");
+
+  // Check the actual values, not just that the two agree: a no-op writes zeros
+  // to both and would otherwise satisfy the comparison.
+  const std::vector<float> want = {0.09003057330846786f, 0.2447284758090973f,
+                                   0.6652409434318542f};
+  for (size_t i = 0; i < 3; ++i) {
+    CHECK_NEAR(out_big[i], want[i], 1e-7);
+    CHECK_NEAR(out_small[i], want[i], 1e-7);
+  }
+}
+
+LLMRT_TEST(softmax_maps_negative_infinity_to_zero) {
+  // How the causal mask reaches softmax: masked positions are set to -inf by
+  // the attention op, and exp(-inf - m) must give exactly 0.
+  const float kNegInf = -std::numeric_limits<float>::infinity();
+  const std::vector<float> x = {1.0f, kNegInf, 3.0f};
+  const std::vector<float> want = {0.11920291185379028f, 0.0f, 0.8807970285415649f};
+
+  const std::vector<float> out = run_softmax(x, {1, 3});
+  for (size_t i = 0; i < 3; ++i) CHECK_NEAR(out[i], want[i], 1e-7);
+  CHECK_TRUE(out[1] == 0.0f);
+}
+
+LLMRT_TEST(softmax_preserves_order) {
+  // A larger input can never produce a smaller output.
+  const std::vector<float> x = {3.0f, -1.0f, 0.5f, 2.0f, -4.0f};
+  const std::vector<float> out = run_softmax(x, {1, 5});
+  for (int i = 0; i < 5; ++i) {
+    for (int j = 0; j < 5; ++j) {
+      if (x[static_cast<size_t>(i)] > x[static_cast<size_t>(j)]) {
+        CHECK_MSG(out[static_cast<size_t>(i)] > out[static_cast<size_t>(j)],
+                  "order was not preserved");
+      }
+    }
+  }
+}
+
+LLMRT_TEST(softmax_rejects_shape_mismatch) {
+  std::vector<float> x(6, 1.0f), out(6, 0.0f);
+  Tensor xt = view_of(x, {2, 3});
+  Tensor ot = view_of(out, {3, 2});
+  bool threw = false;
+  try {
+    cpu::softmax(xt, ot);
+  } catch (const Error&) {
+    threw = true;
+  }
+  CHECK_TRUE(threw);
+}
+
+LLMRT_TEST(softmax_rejects_non_contiguous) {
+  std::vector<float> x(6, 1.0f), out(6, 0.0f);
+  Tensor xt = view_of(x, {2, 3}).transpose(0, 1);
+  Tensor ot = view_of(out, {3, 2});
+  bool threw = false;
+  try {
+    cpu::softmax(xt, ot);
+  } catch (const Error& e) {
+    threw = true;
+    CHECK_MSG(std::string(e.what()).find("softmax") != std::string::npos, e.what());
+  }
+  CHECK_TRUE(threw);
+}
+
+LLMRT_TEST(softmax_rejects_wrong_dtype) {
+  std::vector<float> x(6, 1.0f), out(6, 0.0f);
+  Tensor xt = Tensor::contiguous(x.data(), DType::BF16, DeviceKind::CPU, {2, 3});
+  Tensor ot = view_of(out, {2, 3});
+  bool threw = false;
+  try {
+    cpu::softmax(xt, ot);
+  } catch (const Error&) {
+    threw = true;
+  }
+  CHECK_TRUE(threw);
+}
+
+LLMRT_TEST(softmax_rejects_rank_0_input) {
+  std::vector<float> scalar(1, 1.0f);
+  Tensor xt = view_of(scalar, {});
+  Tensor ot = view_of(scalar, {});
+  bool threw = false;
+  try {
+    cpu::softmax(xt, ot);
   } catch (const Error&) {
     threw = true;
   }

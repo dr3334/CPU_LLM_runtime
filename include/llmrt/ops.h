@@ -99,5 +99,28 @@ void rope_frequencies(int64_t seq_len, int64_t head_dim, float theta, Tensor& co
 // transpose into the rotation is a Phase 8 optimisation.
 void rope_apply(Tensor& q, Tensor& k, const Tensor& cos, const Tensor& sin);
 
+// Numerically stable softmax over the LAST axis:
+//
+//   m       = max_j x[i][j]              (per row, for stability)
+//   e[j]    = exp(x[i][j] - m)
+//   out[i][j] = e[j] / sum_k e[k]
+//
+// The max subtraction is not decorative. Without it exp() overflows for scores
+// above ~88 and the row comes out as [0, nan, nan]; measured against torch on
+// [88, 89, 90]. torch's softmax also subtracts the max -- verified bit-exact --
+// so doing the same is both correct and closer to the reference.
+//
+// Row semantics match rmsnorm: `x` and `out` share a shape of rank >= 1, the
+// leading axes are independent rows flattened, and the last axis is the one
+// normalised. -inf entries are supported and come out as exactly 0, which is
+// how the causal mask is applied (attention adds -inf above the diagonal).
+// A row that is entirely -inf yields NaN, so callers must guarantee at least one
+// unmasked entry -- true for causal attention, where row 0 sees position 0.
+//
+// Note this op takes an explicit output, like the others; attention later fuses
+// it into a single kernel (Phase 8), at which point it stops being called
+// standalone.
+void softmax(const Tensor& x, Tensor& out);
+
 }  // namespace cpu
 }  // namespace llmrt
