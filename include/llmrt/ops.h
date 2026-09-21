@@ -210,5 +210,41 @@ void attention(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out,
 // negative id produces a negative byte offset rather than a large one.
 void embedding(const Tensor& table, const Tensor& ids, Tensor& out);
 
+// Index of the largest element along the LAST axis, per row.
+//
+//   x   [rows, n]   f32
+//   out [rows]      i32
+//
+//   out[i] = the smallest j that maximises x[i][j]
+//
+// Row contract is softmax's: the last axis is reduced, the leading axes are
+// independent rows. A rank-1 input has rows == 1, which is the "argmax of one
+// row of logits" case that sampling needs.
+//
+// Why this is an op rather than a loop in the caller: ops.h is the list of
+// primitives each backend implements, and a GPU backend wants this natively --
+// for a single token the logits row is 151936 floats, and having the kernel
+// return one index beats computing 608 KB and reducing it on the host. It also
+// has semantics that need pinning down rather than assuming, which is what the
+// tests below are for.
+//
+// What it deliberately does NOT do: temperature, top-k, top-p, end-of-sequence
+// handling, or "only take the last position". Those are decoding policy and
+// belong in generate(), not in a reduction a GPU kernel has to be able to
+// implement in one pass.
+//
+// Two contract details, both tested:
+//
+//   * Ties go to the LOWEST index, matching numpy.argmax and torch.argmax.
+//     Left unspecified, two backends could disagree and the same prompt would
+//     produce different tokens depending on which one ran it.
+//   * NaN never wins, anywhere. The reduction is seeded with -infinity, and
+//     `NaN > v` is false for every v, so a NaN is simply skipped. This is
+//     deliberately unlike numpy, which returns the NaN's index: NaN is what
+//     broken weights produce, and this op is not where that should be
+//     diagnosed. A row that is entirely NaN returns index 0, so the caller can
+//     still detect it by looking at that single value.
+void argmax(const Tensor& x, Tensor& out);
+
 }  // namespace cpu
 }  // namespace llmrt

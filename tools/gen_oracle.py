@@ -58,6 +58,14 @@ TEXT_PROMPTS = [
 RANDOM_TOKENS = 12
 RANDOM_SEED = 42
 
+# Greedy continuation capture. 16 steps is enough to catch a plumbing bug in the
+# generation loop and to make "greedy token 100% identical" meaningful, without
+# costing a full forward per step for thousands of steps.
+GREEDY_STEPS = 16
+# From generation_config.json: <|im_end|> and <|endoftext|>. Either ends the
+# sequence, which is what Qwen3 was trained with.
+EOS_TOKEN_IDS = [151645, 151643]
+
 
 def import_reference(ref_dir: str):
     """Import the vendored (pinned) Qwen3 implementation, else stock transformers."""
@@ -199,6 +207,43 @@ def main() -> int:
     golden.add_meta("input_ids", prompt_lengths=lengths, prompt_offsets=offsets)
     golden.add_meta("logits", prompt_lengths=lengths, prompt_offsets=offsets, vocab=int(cfg.vocab_size))
 
+    # ---- 1b) greedy continuations, one token at a time --------------------
+    #
+    # This is what verifies the *generation loop* rather than just the argmax:
+    # the runtime has to feed its own output back in and keep agreeing.
+    #
+    # Deliberately NOT model.generate(). That uses a KV cache, so its per-step
+    # logits come out of a different computation path (cached attention versus a
+    # full re-forward) and differ in the last bits. The runtime being tested has
+    # no cache, so the reference is built the same way it runs -- otherwise the
+    # comparison would be measuring the cache, not the loop.
+    #
+    # The cost is one full forward per generated token: 7 prompts x up to 16
+    # steps. Same reason the runtime is slow without a cache, same magnitude.
+    greedy: list[list[int]] = []
+    greedy_lengths: list[int] = []
+    with torch.no_grad():
+        for p in prompts:
+            ids = [int(t) for t in p]
+            for _ in range(GREEDY_STEPS):
+                out = model(torch.tensor([ids], dtype=torch.long))
+                nxt = int(out.logits[0, -1].argmax())
+                ids.append(nxt)
+                if nxt in EOS_TOKEN_IDS:
+                    break
+            new = ids[len(p):]
+            greedy_lengths.append(len(new))
+            # Right-padded with -1; readers use greedy_lengths and never look
+            # past the end of a sequence.
+            greedy.append(new + [-1] * (GREEDY_STEPS - len(new)))
+
+    golden.add_i32("greedy_ids", torch.tensor(greedy, dtype=torch.int32))
+    golden.add_meta("greedy_ids", greedy_lengths=greedy_lengths, max_new=GREEDY_STEPS,
+                    eos_token_ids=EOS_TOKEN_IDS)
+    hits = sum(1 for n in greedy_lengths if n < GREEDY_STEPS)
+    print(f"greedy         : {GREEDY_STEPS} steps max, lengths={greedy_lengths} "
+          f"({hits} stopped early on eos)")
+
     # ---- 2) per-layer hidden states for prompt 0 -------------------------
     seq0 = prompts[0].unsqueeze(0)
     hiddens = []
@@ -308,6 +353,11 @@ def main() -> int:
             "random_prompt": {"n_tokens": RANDOM_TOKENS, "seed": RANDOM_SEED, "vocab_hi": 1000},
             "prompt_offsets": offsets,
             "prompt_lengths": lengths,
+            # Mirrored at the top level, not only on the array entry, so the C++
+            # reader can use the same flat lookup as prompt_offsets. golden_ids
+            # is right-padded with -1, so these say how much of each row is real.
+            "greedy_lengths": greedy_lengths,
+            "greedy_max_new": GREEDY_STEPS,
         }
     )
 

@@ -1458,4 +1458,169 @@ LLMRT_TEST(embedding_rejects_non_contiguous_table) {
   CHECK_TRUE(embedding_rejects(table, {3, 4}, {0, 1}, {2}, {2, 4}, /*table_strided=*/true));
 }
 
+// ---- argmax ----------------------------------------------------------------
+//
+// The op that turns a logits row into a token id, so its contract is what makes
+// sampling deterministic. Golden's logits are [60, 151936], which is both a real
+// workload and the source of the expected values below.
+
+std::vector<int32_t> run_argmax(const std::vector<float>& x,
+                                const std::vector<int64_t>& shape) {
+  const int64_t n = shape.back();
+  const int64_t rows = static_cast<int64_t>(x.size()) / n;
+  std::vector<int32_t> out(static_cast<size_t>(rows), -1);
+  Tensor xv = view_of(x, shape);
+  Tensor ov = view_of_i32(out, {rows});
+  cpu::argmax(xv, ov);
+  return out;
+}
+
+bool argmax_rejects(const std::vector<float>& x, const std::vector<int64_t>& shape,
+                    const std::vector<int64_t>& out_shape, DType out_dtype = DType::I32,
+                    bool x_strided = false) {
+  size_t need = 1;
+  for (const int64_t d : out_shape) need *= static_cast<size_t>(d);
+  std::vector<int32_t> out(need, 0);
+  std::vector<float> out_f32(need, 0.0f);
+
+  Tensor xv = view_of(x, shape);
+  if (x_strided) {
+    // Same shape, wrong strides: reads the right number of elements in the
+    // wrong order, so only require_contiguous() can catch it.
+    xv.strides[shape.size() - 1] = shape[shape.size() - 2];
+    xv.strides[shape.size() - 2] = 1;
+    if (shape.size() < 2) {
+      xv.strides[0] = 2;
+    }
+  }
+  try {
+    if (out_dtype == DType::I32) {
+      Tensor ov = view_of_i32(out, out_shape);
+      cpu::argmax(xv, ov);
+    } else {
+      Tensor ov = view_of(out_f32, out_shape);
+      cpu::argmax(xv, ov);
+    }
+  } catch (const Error&) {
+    return true;
+  }
+  return false;
+}
+
+// The seven ids a greedy decoder would emit as the next token for each prompt.
+// Computed from golden's logits in Python; hardcoded rather than re-derived so
+// the test does not simply run the same algorithm twice.
+LLMRT_TEST(argmax_matches_golden_last_positions) {
+  golden::Store g;
+  if (!g.available()) return;
+  const golden::Array* lg = g.get("logits");
+  CHECK_TRUE(lg != nullptr);
+  if (lg == nullptr) return;
+  CHECK_EQ(lg->shape[0], int64_t{60});
+
+  const std::vector<int32_t> got = run_argmax(lg->f32, lg->shape);
+  CHECK_EQ(got.size(), size_t{60});
+
+  const std::vector<int64_t> offs = g.prompt_offsets();
+  const std::vector<int64_t> lens = g.prompt_lengths();
+  const std::vector<int32_t> want = {378, 12095, 576, 220, 2130, 220, 198};
+  CHECK_EQ(offs.size(), want.size());
+  if (offs.size() != want.size()) return;
+
+  for (size_t i = 0; i < offs.size(); ++i) {
+    const int64_t last = offs[i] + lens[i] - 1;
+    std::printf("      prompt %zu  last=%2lld  argmax=%6d  expected=%6d\n", i,
+                static_cast<long long>(last), got[static_cast<size_t>(last)], want[i]);
+    CHECK_EQ(got[static_cast<size_t>(last)], want[i]);
+  }
+}
+
+// Property check with no reference implementation: whatever index comes back
+// must hold the largest value, and no earlier index may tie with it. That is
+// exactly "the smallest j that maximises x[j]", so it verifies the op and the
+// tie rule together, over all 9.1 M elements of golden's logits.
+LLMRT_TEST(argmax_picks_the_actual_maximum_in_every_golden_row) {
+  golden::Store g;
+  if (!g.available()) return;
+  const golden::Array* lg = g.get("logits");
+  CHECK_TRUE(lg != nullptr);
+  if (lg == nullptr) return;
+
+  const std::vector<int32_t> got = run_argmax(lg->f32, lg->shape);
+  const int64_t n = lg->shape[1];
+  const int64_t rows = lg->shape[0];
+
+  int64_t bad_value = 0;
+  int64_t bad_tie = 0;
+  for (int64_t r = 0; r < rows; ++r) {
+    const float* row = lg->f() + r * n;
+    const float picked = row[got[static_cast<size_t>(r)]];
+    for (int64_t j = 0; j < n; ++j) {
+      if (row[j] > picked) ++bad_value;               // something bigger exists
+      if (j < got[static_cast<size_t>(r)] && row[j] == picked) ++bad_tie;  // not the first
+    }
+  }
+  CHECK_MSG(bad_value == 0,
+            std::to_string(bad_value) + " positions where a larger logit was skipped");
+  CHECK_MSG(bad_tie == 0,
+            std::to_string(bad_tie) + " positions where an earlier index tied with the "
+                                      "chosen one (ties must take the lowest index)");
+  std::printf("      checked %lld x %lld = %lld logits\n", static_cast<long long>(rows),
+              static_cast<long long>(n), static_cast<long long>(rows * n));
+}
+
+// The tie rule, on data where it is unambiguous. Without this, a backend that
+// kept the LAST maximal index would pass everything else and silently disagree
+// with numpy/torch.
+LLMRT_TEST(argmax_picks_the_lowest_index_on_ties) {
+  CHECK_EQ(run_argmax({1.0f, 3.0f, 3.0f, 2.0f}, {4}), std::vector<int32_t>{1});
+  CHECK_EQ(run_argmax({5.0f, 1.0f, 5.0f, 1.0f, 5.0f}, {5}), std::vector<int32_t>{0});
+  // Flat row: index 0 is the lowest maximiser.
+  CHECK_EQ(run_argmax({2.0f, 2.0f, 2.0f}, {3}), std::vector<int32_t>{0});
+  // Single element is its own answer.
+  CHECK_EQ(run_argmax({-7.5f}, {1}), std::vector<int32_t>{0});
+}
+
+LLMRT_TEST(argmax_flattens_the_leading_axes_into_rows) {
+  // [4, 3]: the leading axes flatten into independent rows, same contract as
+  // softmax. Row 3 is the one that catches a stale accumulator -- a shared
+  // `best` carried across rows would report 2 for it.
+  const std::vector<float> x = {
+      1.0f, 9.0f, 2.0f,     // -> 1
+      3.0f, 2.0f, 1.0f,     // -> 0
+      5.0f, 6.0f, 7.0f,     // -> 2
+      -2.0f, -1.0f, -3.0f,  // -> 1
+  };
+  CHECK_EQ(run_argmax(x, {4, 3}), (std::vector<int32_t>{1, 0, 2, 1}));
+
+  // Same values, one extra leading axis: [2, 2, 3] is still four rows.
+  CHECK_EQ(run_argmax(x, {2, 2, 3}), (std::vector<int32_t>{1, 0, 2, 1}));
+}
+
+LLMRT_TEST(argmax_never_selects_a_nan) {
+  // NaN is what broken weights produce. It loses to every finite value, even in
+  // position 0 -- seeding the reduction with -infinity rather than row[0] is
+  // what removes that special case. numpy would return the NaN's index instead;
+  // this op deliberately does not, and the difference is pinned here.
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  CHECK_EQ(run_argmax({1.0f, nan, 2.0f}, {3}), std::vector<int32_t>{2});
+  CHECK_EQ(run_argmax({nan, 1.0f, 2.0f}, {3}), std::vector<int32_t>{2});
+  CHECK_EQ(run_argmax({nan, 2.0f, 1.0f}, {3}), std::vector<int32_t>{1});
+  // A row that is entirely NaN returns the seed index, which the caller can
+  // detect by looking at that one value.
+  CHECK_EQ(run_argmax({nan, nan, nan}, {3}), std::vector<int32_t>{0});
+}
+
+LLMRT_TEST(argmax_rejects_bad_arguments) {
+  const std::vector<float> x = {1.0f, 2.0f, 3.0f, 4.0f};
+  // Three indices for two rows is one too many.
+  CHECK_TRUE(argmax_rejects(x, {2, 2}, {3}));
+  // ...and two for four rows is one too few.
+  CHECK_TRUE(argmax_rejects(x, {2, 2}, {1}));
+  // Indices are I32; an F32 output would quietly reinterpret them.
+  CHECK_TRUE(argmax_rejects(x, {2, 2}, {2}, DType::F32));
+  // Strided input: same shape, wrong strides.
+  CHECK_TRUE(argmax_rejects(x, {2, 2}, {2}, DType::I32, /*x_strided=*/true));
+}
+
 int main() { return llmrt_test::run_all("ops_cpu"); }

@@ -25,7 +25,9 @@ add_library(llmrt_core STATIC
   src/io/safetensors.cpp
   src/model/config.cpp
   src/model/forward.cpp
+  src/model/generate.cpp
   src/model/weights.cpp
+  src/ops/cpu/argmax.cpp
   src/ops/cpu/attention.cpp
   src/ops/cpu/embedding.cpp
   src/ops/cpu/matmul.cpp

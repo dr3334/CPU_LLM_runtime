@@ -7,53 +7,24 @@
 // captured each decoder layer's output, so that test names the first layer that
 // diverges, turning a 28-layer search into a single layer.
 //
-// Loading the checkpoint and building the 2.4 GB f32 weight mirror takes
-// seconds, so every test in this file shares one instance.
+// The generation loop lives in test_generate, in its own binary, because each
+// generated token costs a full forward pass and mixing the two made this suite
+// take over a minute. This one is ~20 s; that one is ~55 s.
 
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
-#include <memory>
 #include <string>
 #include <vector>
 
 #include "llmrt/common.h"
-#include "llmrt/config.h"
 #include "llmrt/forward.h"
-#include "llmrt/model.h"
-#include "llmrt/safetensors.h"
 
 #include "golden.h"
+#include "model_fixture.h"
 #include "test_framework.h"
 
 using namespace llmrt;
-
-namespace {
-
-std::string model_path(const char* file) {
-  return golden::default_model_dir() + "/" + file;
-}
-
-bool checkpoint_exists() {
-  return std::ifstream(model_path("model.safetensors")).good();
-}
-
-// Built once and shared. All three have to outlive the forward pass -- the
-// SafeTensors mmap in particular, since the binding stores pointers into it --
-// so they are static inside the initialiser rather than locals of it.
-Qwen3Forward* shared_forward() {
-  static Qwen3Forward* instance = []() -> Qwen3Forward* {
-    golden::Store g;
-    if (!g.available() || !checkpoint_exists()) return nullptr;
-    static const SafeTensors st = SafeTensors::open(model_path("model.safetensors"));
-    static const Qwen3Config cfg = Qwen3Config::from_model_dir(golden::default_model_dir());
-    static const Qwen3Weights weights = Qwen3Weights::bind(st, cfg);
-    return new Qwen3Forward(st, weights);
-  }();
-  return instance;
-}
-
-}  // namespace
+using llmrt_test::shared_forward;
 
 // Bisect helper. golden's layer_hidden is [28, 1, 12, 1024] and covers prompt 0
 // only, so this runs that one prompt and checks each layer's output as the
@@ -85,9 +56,9 @@ LLMRT_TEST(forward_hidden_states_match_golden_layer_by_layer) {
   states.reserve(static_cast<size_t>(layers));
   std::vector<float> logits;
   fwd->run(prompt0, logits, [&](int64_t layer, const std::vector<float>& h) {
-    // The observer is asked to hand over each layer in order. Copying costs
-    // 48 KB per layer for this prompt and keeps the comparison below off the
-    // forward pass's scratch, which the next layer overwrites.
+    // The observer hands over each layer in order. Copying costs 48 KB per layer
+    // for this prompt and keeps the comparison below off the forward pass's
+    // scratch, which the next layer overwrites.
     CHECK_EQ(layer, static_cast<int64_t>(states.size()));
     CHECK_EQ(h.size(), per_layer);
     states.push_back(h);
@@ -142,7 +113,8 @@ LLMRT_TEST(forward_matches_golden_logits) {
     fwd->run(prompt, logits);
 
     const size_t n = static_cast<size_t>(len) * static_cast<size_t>(vocab);
-    const float* want_rows = want->f() + static_cast<size_t>(begin) * static_cast<size_t>(vocab);
+    const float* want_rows =
+        want->f() + static_cast<size_t>(begin) * static_cast<size_t>(vocab);
     const golden::Diff d = golden::compare(logits.data(), want_rows, n);
     std::printf("      prompt %zu (%2lld tokens)  %s\n", i, static_cast<long long>(len),
                 golden::diff_string(d).c_str());

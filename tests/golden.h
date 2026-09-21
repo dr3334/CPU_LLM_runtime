@@ -117,6 +117,16 @@ class Store {
     return out;
   }
 
+  // How many of each greedy_ids row are real. The array is right-padded with -1
+  // so that it can be rectangular; these lengths say where each sequence stops.
+  std::vector<int64_t> greedy_lengths() const {
+    std::vector<int64_t> out;
+    if (const llmrt::json::Value::Array* v = manifest_.get_array("greedy_lengths")) {
+      for (const llmrt::json::Value& e : *v) out.push_back(e.as_int());
+    }
+    return out;
+  }
+
  private:
   std::string dir_;
   bool available_ = false;

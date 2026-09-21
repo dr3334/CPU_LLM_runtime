@@ -193,8 +193,15 @@ LLMRT_TEST(parses_golden_manifest) {
   const Value* arrays = m.find("arrays");
   CHECK_TRUE(arrays != nullptr);
   CHECK_TRUE(arrays->is_object());
-  CHECK_EQ(arrays->size(), size_t{31});
-  CHECK_TRUE(arrays->contains("logits"));
+  // Presence, not an exact count. The fixture set grows whenever a new
+  // intermediate is worth capturing (greedy_ids was the most recent), and a
+  // hard-coded total turns that into a failure here -- in a file that has
+  // nothing to do with the golden. These names are what the test is about.
+  CHECK_TRUE(arrays->size() >= 31);
+  for (const char* name : {"logits", "input_ids", "greedy_ids", "layer_hidden", "embed_out",
+                           "final_norm"}) {
+    CHECK_MSG(arrays->contains(name), std::string("manifest is missing ") + name);
+  }
 
   const Value& logits = m.at("arrays").at("logits");
   CHECK_EQ(logits.get_string("dtype"), std::string("f32"));
