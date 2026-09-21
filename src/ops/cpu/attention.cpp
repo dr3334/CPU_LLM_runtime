@@ -101,6 +101,7 @@
 
 #include <cmath>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "llmrt/common.h"
@@ -110,35 +111,77 @@ namespace cpu {
 
 namespace {
 
-// TODO(你): 仿照 check_softmax_args 实现参数校验。
+// Four tensors and a params struct, so this is the widest argument check in the
+// project. Order matches the other ops and goes from "can this memory be read
+// at all" to "does it describe the operation we think it does": contiguity,
+// device, dtype, rank, shapes, then the params the shapes are compared against.
 //
-// 需要检查的（不检查的后果都写在括号里）：
-//
-//   连续性     q / k / v / out 四个都要 require_contiguous
-//              （跨步视图被当连续读，读到别的元素）
-//   设备       q / k / v / out 都在 CPU 上
-//   类型       都是 F32
-//   维度       q / k / v 是 rank 4，out 是 rank 3
-//              （下面所有 dim(i) 都假设了轴数）
-//   形状一致性
-//                k.shape == v.shape                        k 和 v 必须同形
-//                q.dim(0) == k.dim(0)                      同一个 batch
-//                q.dim(2) == k.dim(2)                      S 必须一致
-//                q.dim(3) == k.dim(3) == params.head_dim   D 必须一致
-//                q.dim(1) == params.num_heads
-//                k.dim(1) == params.num_kv_heads
-//                out.shape == {B, S, num_heads * head_dim}  ← 注意是 H*D，不是 D
-//   参数       num_heads > 0、num_kv_heads > 0、head_dim > 0
-//              num_heads % num_kv_heads == 0             GQA 必须整除
-//
-// 错误信息里把实际形状打出来（用 shape_string()），否则修的时候还得自己翻。
+// Every message prints the actual shapes. Without them a mismatch sends you
+// back to the call site to work out which tensor was wrong.
 void check_attention_args(const Tensor& q, const Tensor& k, const Tensor& v,
                           const Tensor& out, const AttentionParams& params) {
-  (void)q;
-  (void)k;
-  (void)v;
-  (void)out;
-  (void)params;
+  q.require_contiguous("attention");
+  k.require_contiguous("attention");
+  v.require_contiguous("attention");
+  out.require_contiguous("attention");
+
+  LLMRT_CHECK(q.is_cpu() && k.is_cpu() && v.is_cpu() && out.is_cpu(),
+              "attention: all tensors must be host (CPU) tensors");
+  LLMRT_CHECK(q.dtype == DType::F32 && k.dtype == DType::F32 && v.dtype == DType::F32 &&
+                  out.dtype == DType::F32,
+              "attention: all tensors must be F32");
+
+  // Positivity first, so the modulo below cannot divide by zero.
+  LLMRT_CHECK(params.num_heads > 0 && params.num_kv_heads > 0 && params.head_dim > 0,
+              "attention: num_heads, num_kv_heads and head_dim must all be positive, got " +
+                  std::to_string(params.num_heads) + ", " +
+                  std::to_string(params.num_kv_heads) + " and " +
+                  std::to_string(params.head_dim));
+  LLMRT_CHECK(params.num_heads % params.num_kv_heads == 0,
+              "attention: num_heads (" + std::to_string(params.num_heads) +
+                  ") must be a multiple of num_kv_heads (" +
+                  std::to_string(params.num_kv_heads) +
+                  "); GQA repeats each kv head an equal number of times");
+
+  // The rank checks come before any dim(i) call: every shape assertion below
+  // assumes these axis counts exist.
+  LLMRT_CHECK(q.rank() == 4 && k.rank() == 4 && v.rank() == 4,
+              "attention: q, k and v must be rank 4 [batch, head, seq, dim], got " +
+                  std::to_string(q.rank()) + ", " + std::to_string(k.rank()) + " and " +
+                  std::to_string(v.rank()));
+  LLMRT_CHECK(out.rank() == 3,
+              "attention: out must be rank 3 [batch, seq, num_heads * head_dim], got rank " +
+                  std::to_string(out.rank()) + " shape " + out.shape_string());
+
+  LLMRT_CHECK(k.shape == v.shape,
+              "attention: k and v must have identical shapes, got " + k.shape_string() +
+                  " and " + v.shape_string());
+  LLMRT_CHECK(q.dim(0) == k.dim(0),
+              "attention: batch mismatch, q is " + q.shape_string() + " and k is " +
+                  k.shape_string());
+  LLMRT_CHECK(q.dim(2) == k.dim(2),
+              "attention: sequence length mismatch, q is " + q.shape_string() +
+                  " and k is " + k.shape_string());
+  LLMRT_CHECK(q.dim(3) == k.dim(3) && q.dim(3) == params.head_dim,
+              "attention: head_dim mismatch, q is " + q.shape_string() + ", k is " +
+                  k.shape_string() + " and params.head_dim is " +
+                  std::to_string(params.head_dim));
+  LLMRT_CHECK(q.dim(1) == params.num_heads,
+              "attention: q has " + std::to_string(q.dim(1)) +
+                  " heads but params.num_heads is " + std::to_string(params.num_heads));
+  LLMRT_CHECK(k.dim(1) == params.num_kv_heads,
+              "attention: k has " + std::to_string(k.dim(1)) +
+                  " kv heads but params.num_kv_heads is " +
+                  std::to_string(params.num_kv_heads));
+
+  // out's width is H*D, not D, and not H (a [B,S,H,D] tensor has the same
+  // element count as [B,S,H*D] and would otherwise slip through).
+  const int64_t expected_width = params.num_heads * params.head_dim;
+  LLMRT_CHECK(out.dim(0) == q.dim(0) && out.dim(1) == q.dim(2) &&
+                  out.dim(2) == expected_width,
+              "attention: out must be [batch, seq, num_heads * head_dim] = [" +
+                  std::to_string(q.dim(0)) + ", " + std::to_string(q.dim(2)) + ", " +
+                  std::to_string(expected_width) + "] but is " + out.shape_string());
 }
 
 }  // namespace
@@ -147,62 +190,99 @@ void attention(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out,
                const AttentionParams& params) {
   check_attention_args(q, k, v, out, params);
 
-  // TODO(你): 实现。骨架大致是：
+  const int64_t B = q.dim(0);
+  const int64_t H = params.num_heads;
+  const int64_t Kv = params.num_kv_heads;
+  const int64_t S = q.dim(2);
+  const int64_t D = params.head_dim;
+  const int64_t groups = params.num_kv_groups();
+  const int64_t width = H * D;  // out's last axis: heads flattened, head-major
+
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  const float masked = -std::numeric_limits<float>::max();  // -FLT_MAX, see the header
+
+  const float* q_base = q.f32();
+  const float* k_base = k.f32();
+  const float* v_base = v.f32();
+  float* out_base = out.f32();
+
+  // One row of scores, reused by every (batch, head, query position). This is
+  // why the [H, S, S] score matrix is never materialised: at S = 512 that would
+  // be 16 MB of write-then-read, while this is 2 KiB and stays in L1 (and even
+  // the longest Qwen3 context, 40960, only reaches 160 KiB, inside L2).
   //
-  //   const int64_t B  = q.dim(0);
-  //   const int64_t H  = params.num_heads;
-  //   const int64_t Kv = params.num_kv_heads;
-  //   const int64_t S  = q.dim(2);
-  //   const int64_t D  = params.head_dim;
-  //   const int64_t groups = params.num_kv_groups();
-  //   const float   scale  = 1.0f / std::sqrt(static_cast<float>(D));
-  //   const float   neg    = -std::numeric_limits<float>::max();   // -FLT_MAX
-  //
-  //   const float* q_base = q.f32();
-  //   const float* k_base = k.f32();
-  //   const float* v_base = v.f32();
-  //   float*       o_base = out.f32();
-  //
-  //   std::vector<float> scores(static_cast<size_t>(S));   // 一行，摊到所有 head/i 复用
-  //
-  //   for (b ...) {
-  //     for (h ...) {
-  //       const int64_t g = h / groups;
-  //       // q[b][h] 的基址、k[b][g] 的基址、v[b][g] 的基址
-  //       for (i ...) {
-  //         // 1) scores[j] = dot(q[b][h][i], k[b][g][j]) * scale
-  //         // 2) causal 时 j > i 的置 neg
-  //         // 3) 包成 [S] 的 Tensor 交给 cpu::softmax（原地）
-  //         // 4) out[b][i][h*D + d] = Σ_j probs[j] * v[b][g][j][d]
-  //         //    注意 j 外层 d 内层
-  //       }
-  //     }
-  //   }
-  //
-  // 几个具体提示：
-  //
-  //   - q[b][h][i] 的起点 = q_base + ((b*H + h)*S + i) * D
-  //     k[b][g][j] 的起点 = k_base + ((b*Kv + g)*S + j) * D
-  //     v 同 k 的算法；out[b][i] 的起点 = o_base + (b*S + i) * (H*D)
-  //     推荐照 rope.cpp 的做法：每个循环开头把行基址提出一个局部变量，
-  //     别在表达式里反复写 ((b*H+h)*S+i)*D 这种 —— 错一个括号就悄悄偏了。
-  //
-  //   - 第 4 步的 out_row 要先清零（j 从 0 累加），或者用 j = 0 的那一项
-  //     直接赋值、再从 j = 1 累加，省一趟清零。
-  //
-  //   - causal 判断：参考实现是 `arange(target) > cache_position`，
-  //     即 mask[i][j] 在 j > i 时为真。所以 i 行只允许 j <= i。
-  //
-  //   - softmax 原地调用：
-  //       Tensor sc = Tensor::contiguous(scores.data(), DType::F32,
-  //                                      DeviceKind::CPU, {S});
-  //       cpu::softmax(sc, sc);
-  //     注意 Tensor 是视图，这个 sc 指向 scores 这块内存，不会拷贝。
-  (void)q;
-  (void)k;
-  (void)v;
-  (void)out;
-  (void)params;
+  // The Tensor wrapper is built once, outside the loops. Building it inside
+  // would allocate two std::vectors per iteration, H*S of them, for nothing --
+  // `scores` is never resized, so its address stays valid.
+  std::vector<float> scores(static_cast<size_t>(S));
+  Tensor scores_view = Tensor::contiguous(scores.data(), DType::F32, DeviceKind::CPU, {S});
+
+  for (int64_t b = 0; b < B; ++b) {
+    for (int64_t h = 0; h < H; ++h) {
+      // GQA: query head h reads kv head h / groups. NOT h % groups -- see the
+      // header, where the wrong mapping measures rel ~0.96.
+      const int64_t g = h / groups;
+
+      // Row bases, hoisted out of the inner loops. Written inline these would be
+      // ((b*H + h)*S + i)*D and friends, repeated a dozen times, one parenthesis
+      // away from a silent offset error.
+      const float* q_head = q_base + ((b * H + h) * S) * D;
+      const float* k_head = k_base + ((b * Kv + g) * S) * D;
+      const float* v_head = v_base + ((b * Kv + g) * S) * D;
+
+      for (int64_t i = 0; i < S; ++i) {
+        const float* q_row = q_head + i * D;
+
+        // scores[j] = dot(q[i], k[j]) * scale. d innermost, so both rows are
+        // walked contiguously -- the same layout argument as matmul's
+        // transpose_b branch. Striding k by D instead would touch a fresh cache
+        // line for every element.
+        for (int64_t j = 0; j < S; ++j) {
+          const float* k_row = k_head + j * D;
+          float dot = 0.0f;
+          for (int64_t d = 0; d < D; ++d) dot += q_row[d] * k_row[d];
+          scores[static_cast<size_t>(j)] = dot * scale;
+        }
+
+        // Query position i may attend to key positions j <= i only. The
+        // reference's mask is `arange(target_length) > cache_position`, i.e.
+        // j > i is masked.
+        //
+        // Assigning `masked` rather than adding the mask is exact: a finite
+        // score plus -FLT_MAX rounds to -FLT_MAX anyway, which is what the
+        // reference computes.
+        if (params.causal) {
+          for (int64_t j = i + 1; j < S; ++j) scores[static_cast<size_t>(j)] = masked;
+        }
+
+        // Delegated to the softmax op rather than open-coded: same last-axis
+        // contract, so all 100+ softmax call sites in a forward pass share one
+        // implementation. In place is safe -- softmax reads x_row[j] before it
+        // writes out_row[j], and here those are the same address.
+        cpu::softmax(scores_view, scores_view);
+
+        // out[i] = sum_j probs[j] * v[j], in outer-product order: j outer, d
+        // inner, so v and out are both walked contiguously. This is the mirror
+        // image of the scores loop above, and the reason no transposed copy of
+        // v is ever needed.
+        //
+        // Seeded with the j = 0 term instead of zeroing first, saving a pass
+        // over out_row. 0.0f + x == x bit-for-bit for every x except x == -0.0f,
+        // and -0.0f compares equal to 0.0f regardless.
+        float* out_row = out_base + (b * S + i) * width + h * D;
+        {
+          const float p = scores[0];
+          const float* v_row = v_head;
+          for (int64_t d = 0; d < D; ++d) out_row[d] = p * v_row[d];
+        }
+        for (int64_t j = 1; j < S; ++j) {
+          const float p = scores[static_cast<size_t>(j)];
+          const float* v_row = v_head + j * D;
+          for (int64_t d = 0; d < D; ++d) out_row[d] += p * v_row[d];
+        }
+      }
+    }
+  }
 }
 
 }  // namespace cpu
