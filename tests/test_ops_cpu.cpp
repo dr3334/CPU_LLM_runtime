@@ -1306,4 +1306,156 @@ LLMRT_TEST(attention_rejects_non_contiguous_input) {
                                attention_params(fx), /*make_q_strided=*/true));
 }
 
+// ---- embedding -------------------------------------------------------------
+//
+// The only op that does no arithmetic, so its golden comparison is exact rather
+// than approximate. embed_out covers prompt 0's 12 positions only, which is
+// what the first test below compares.
+
+Tensor view_of_i32(const std::vector<int32_t>& v, std::vector<int64_t> shape) {
+  return Tensor::contiguous(const_cast<int32_t*>(v.data()), DType::I32, DeviceKind::CPU,
+                            std::move(shape));
+}
+
+std::vector<float> run_embedding(const std::vector<float>& table,
+                                 const std::vector<int64_t>& table_shape,
+                                 const std::vector<int32_t>& ids) {
+  const int64_t hidden = table_shape.back();
+  std::vector<float> out(static_cast<size_t>(ids.size()) * static_cast<size_t>(hidden));
+  Tensor tv = view_of(table, table_shape);
+  Tensor iv = view_of_i32(ids, {static_cast<int64_t>(ids.size())});
+  Tensor ov = view_of(out, {static_cast<int64_t>(ids.size()), hidden});
+  cpu::embedding(tv, iv, ov);
+  return out;
+}
+
+bool embedding_rejects(const std::vector<float>& table,
+                       const std::vector<int64_t>& table_shape,
+                       const std::vector<int32_t>& ids,
+                       const std::vector<int64_t>& ids_shape,
+                       const std::vector<int64_t>& out_shape, bool table_strided = false) {
+  size_t need = 1;
+  for (const int64_t d : out_shape) need *= static_cast<size_t>(d);
+  std::vector<float> out(need, 0.0f);
+
+  Tensor tv = view_of(table, table_shape);
+  if (table_strided) {
+    // Column-major: same shape, wrong strides. This is exactly the shape the
+    // table takes if someone reuses embed_tokens' storage for lm_head and
+    // transposes it without materialising.
+    tv.strides[0] = 1;
+    tv.strides[1] = table_shape[0];
+  }
+  Tensor iv = view_of_i32(ids, ids_shape);
+  Tensor ov = view_of(out, out_shape);
+  try {
+    cpu::embedding(tv, iv, ov);
+  } catch (const Error&) {
+    return true;
+  }
+  return false;
+}
+
+LLMRT_TEST(embedding_matches_golden_bit_for_bit) {
+  golden::Store g;
+  if (!g.available() || !checkpoint_exists()) return;
+  size_t count = 0;
+  const int32_t* ids = g.ids("input_ids", &count);
+  const golden::Array* want = g.get("embed_out");
+  CHECK_TRUE(ids != nullptr && want != nullptr);
+  if (ids == nullptr || want == nullptr) return;
+  CHECK_EQ(count, size_t{60});
+
+  const SafeTensors st = SafeTensors::open(model_path("model.safetensors"));
+  const std::vector<float> table = st.to_f32("model.embed_tokens.weight");
+
+  const int64_t S = want->shape[0];
+  const std::vector<int32_t> prompt0(ids, ids + S);
+  const std::vector<float> out = run_embedding(table, {151936, 1024}, prompt0);
+
+  CHECK_EQ(out.size(), want->f32.size());
+  const int cmp =
+      std::memcmp(out.data(), want->f32.data(), want->f32.size() * sizeof(float));
+  std::printf("      embedding  memcmp=%d (%s)\n", cmp, cmp == 0 ? "逐位相同" : "不相同");
+  CHECK_MSG(cmp == 0,
+            "embedding is a pure gather, so it must reproduce embed_out exactly; any "
+            "difference means arithmetic (a scale, a padding row, a normalisation) "
+            "crept in");
+}
+
+LLMRT_TEST(embedding_is_a_pure_gather_with_no_arithmetic) {
+  // Deliberately awkward bit patterns. Any implementation that "helpfully"
+  // normalises -0.0, flushes a subnormal, or scales by sqrt(hidden_size) changes
+  // at least one of these.
+  const float denorm = std::numeric_limits<float>::denorm_min();
+  const std::vector<float> table = {
+      1.0f, -0.0f, denorm,                                     // row 0
+      -1.0f, 0.5f, std::numeric_limits<float>::max(),           // row 1
+      0.0f, 2.0f, -3.5f,                                        // row 2
+  };
+  const std::vector<int32_t> ids = {2, 0, 1, 1, 0};
+  const std::vector<float> out = run_embedding(table, {3, 3}, ids);
+
+  CHECK_EQ(out.size(), size_t{15});
+  for (size_t s = 0; s < ids.size(); ++s) {
+    const float* row = table.data() + static_cast<size_t>(ids[s]) * 3;
+    CHECK_EQ(std::memcmp(out.data() + s * 3, row, 3 * sizeof(float)), 0);
+  }
+  // -0.0f is the interesting one: 0.0f == -0.0f compares equal, so only the bits
+  // prove it survived. out[4] is ids[1] == 0 -> table[0][1].
+  CHECK_TRUE(std::signbit(out[4]));
+}
+
+LLMRT_TEST(embedding_rejects_out_of_range_id) {
+  const std::vector<float> table(3 * 4, 0.5f);
+  CHECK_TRUE(embedding_rejects(table, {3, 4}, {0, 3}, {2}, {2, 4}));  // 3 == vocab
+  CHECK_TRUE(embedding_rejects(table, {3, 4}, {0, 1000000}, {2}, {2, 4}));
+}
+
+LLMRT_TEST(embedding_rejects_negative_id) {
+  // int32_t is signed, so a negative id produces a negative byte offset: it
+  // walks off the FRONT of the table. An upper-bound-only check misses this.
+  const std::vector<float> table(3 * 4, 0.5f);
+  CHECK_TRUE(embedding_rejects(table, {3, 4}, {-1, 0}, {2}, {2, 4}));
+  CHECK_TRUE(embedding_rejects(table, {3, 4}, {0, std::numeric_limits<int32_t>::min()}, {2},
+                               {2, 4}));
+}
+
+LLMRT_TEST(embedding_rejects_float_ids) {
+  const std::vector<float> table(3 * 4, 0.5f);
+  std::vector<float> out(2 * 4, 0.0f);
+  const std::vector<float> float_ids = {0.0f, 1.0f};
+  Tensor tv = view_of(table, {3, 4});
+  Tensor iv = view_of(float_ids, {2});
+  Tensor ov = view_of(out, {2, 4});
+  bool threw = false;
+  try {
+    cpu::embedding(tv, iv, ov);
+  } catch (const Error&) {
+    threw = true;
+  }
+  CHECK_TRUE(threw);
+}
+
+LLMRT_TEST(embedding_rejects_shape_mismatch) {
+  const std::vector<float> table(3 * 4, 0.5f);
+  // out must be [S, hidden]; [2, 3] has the wrong row width.
+  CHECK_TRUE(embedding_rejects(table, {3, 4}, {0, 1}, {2}, {2, 3}));
+  // and [3, 4] has the wrong number of rows for 2 ids.
+  CHECK_TRUE(embedding_rejects(table, {3, 4}, {0, 1}, {2}, {3, 4}));
+}
+
+LLMRT_TEST(embedding_rejects_wrong_rank) {
+  const std::vector<float> table(3 * 4, 0.5f);
+  // ids must be 1-D; [2, 1] holds the same two values.
+  CHECK_TRUE(embedding_rejects(table, {3, 4}, {0, 1}, {2, 1}, {2, 4}));
+  // table must be 2-D.
+  CHECK_TRUE(embedding_rejects(table, {12}, {0, 1}, {2}, {2, 4}));
+}
+
+LLMRT_TEST(embedding_rejects_non_contiguous_table) {
+  const std::vector<float> table(3 * 4, 0.5f);
+  CHECK_TRUE(embedding_rejects(table, {3, 4}, {0, 1}, {2}, {2, 4}, /*table_strided=*/true));
+}
+
 int main() { return llmrt_test::run_all("ops_cpu"); }

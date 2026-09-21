@@ -26,6 +26,7 @@ add_library(llmrt_core STATIC
   src/model/config.cpp
   src/model/weights.cpp
   src/ops/cpu/attention.cpp
+  src/ops/cpu/embedding.cpp
   src/ops/cpu/matmul.cpp
   src/ops/cpu/rmsnorm.cpp
   src/ops/cpu/rope.cpp

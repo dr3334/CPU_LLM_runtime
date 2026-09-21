@@ -178,5 +178,37 @@ void softmax(const Tensor& x, Tensor& out);
 void attention(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out,
                const AttentionParams& params);
 
+// Gathers rows of an embedding table by token id.
+//
+//   table [vocab, hidden]   f32
+//   ids   [S]               i32, every value in [0, vocab)
+//   out   [S, hidden]       f32
+//
+//   out[s][:] = table[ids[s]][:]
+//
+// This is the only op in the runtime that performs no arithmetic -- it moves
+// bytes. Three things it therefore does NOT do, each of which has a counterpart
+// in other models and would be easy to add by mistake:
+//
+//   * no padding row. Qwen3's config has no pad_token_id, so the reference
+//     builds nn.Embedding(..., padding_idx=None) and every id names a real row.
+//     (Measured: the checkpoint contains zero all-zero rows.)
+//   * no scaling. Gemma-style models multiply the embedding by sqrt(hidden_size);
+//     modeling_qwen3.py contains no such factor.
+//   * no renormalisation.
+//
+// Because there is no arithmetic, this op's golden comparison is exact rather
+// than approximate: table[input_ids] reproduces embed_out bit for bit, verified
+// at max absolute difference 0.0. That is a property of the construction, not
+// of the tolerance.
+//
+// `ids` is the one tensor in the runtime with an integer dtype, so its checks
+// differ from everything else here: I32 rather than F32, plus a range check.
+// An id outside [0, vocab) reads past the table -- the silent-corruption class
+// of bug -- and the scan costs O(S) against a gather that moves S*hidden floats.
+// The lower bound matters as much as the upper one: int32_t is signed, so a
+// negative id produces a negative byte offset rather than a large one.
+void embedding(const Tensor& table, const Tensor& ids, Tensor& out);
+
 }  // namespace cpu
 }  // namespace llmrt
