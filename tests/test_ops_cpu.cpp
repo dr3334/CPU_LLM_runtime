@@ -1119,4 +1119,191 @@ LLMRT_TEST(softmax_rejects_rank_0_input) {
   CHECK_TRUE(threw);
 }
 
+// ---- attention -------------------------------------------------------------
+//
+// Every input attention needs is already captured, so the whole op can be
+// checked end to end without running a layer:
+//
+//   rope_q_out  [1, 16, 12, 128]   q after QK-Norm and RoPE
+//   rope_k_out  [1,  8, 12, 128]   k after QK-Norm and RoPE
+//   v_proj_out  [1, 12, 1024]      v straight from the projection (no RoPE)
+//   attn_out    [1, 12, 2048]      the o_proj input
+//
+// v needs the reshape/transpose the model does: view(B,S,Kv,D).transpose(1,2).
+struct AttentionFixture {
+  std::vector<float> q, k, v, want;
+  int64_t B = 1, H = 16, Kv = 8, S = 12, D = 128;
+  bool ok = false;
+};
+
+AttentionFixture load_attention_fixture() {
+  AttentionFixture fx;
+  golden::Store g;
+  if (!g.available()) return fx;
+  const golden::Array* q = g.get("rope_q_out");
+  const golden::Array* k = g.get("rope_k_out");
+  const golden::Array* v = g.get("v_proj_out");
+  const golden::Array* w = g.get("attn_out");
+  if (q == nullptr || k == nullptr || v == nullptr || w == nullptr) return fx;
+
+  fx.q = q->f32;
+  fx.k = k->f32;
+  fx.want = w->f32;
+
+  // v_proj_out comes out as [B, S, Kv, D]; attention wants [B, Kv, S, D].
+  fx.v.resize(v->f32.size());
+  for (int64_t s = 0; s < fx.S; ++s) {
+    for (int64_t g_ = 0; g_ < fx.Kv; ++g_) {
+      for (int64_t d = 0; d < fx.D; ++d) {
+        fx.v[static_cast<size_t>((g_ * fx.S + s) * fx.D + d)] =
+            v->f32[static_cast<size_t>((s * fx.Kv + g_) * fx.D + d)];
+      }
+    }
+  }
+
+  fx.ok = true;
+  return fx;
+}
+
+AttentionParams attention_params(const AttentionFixture& fx, bool causal = true) {
+  AttentionParams p;
+  p.num_heads = fx.H;
+  p.num_kv_heads = fx.Kv;
+  p.head_dim = fx.D;
+  p.causal = causal;
+  return p;
+}
+
+std::vector<float> run_attention(const AttentionFixture& fx, bool causal = true) {
+  std::vector<float> out(static_cast<size_t>(fx.B * fx.S * fx.H * fx.D));
+  Tensor qv = view_of(fx.q, {fx.B, fx.H, fx.S, fx.D});
+  Tensor kv = view_of(fx.k, {fx.B, fx.Kv, fx.S, fx.D});
+  Tensor vv = view_of(fx.v, {fx.B, fx.Kv, fx.S, fx.D});
+  Tensor ov = view_of(out, {fx.B, fx.S, fx.H * fx.D});
+  cpu::attention(qv, kv, vv, ov, attention_params(fx, causal));
+  return out;
+}
+
+// True when attention rejects the arguments instead of computing something wrong.
+bool attention_rejects(const std::vector<float>& q, const std::vector<int64_t>& q_shape,
+                       const std::vector<float>& k, const std::vector<int64_t>& k_shape,
+                       const std::vector<float>& v, const std::vector<int64_t>& v_shape,
+                       std::vector<int64_t> out_shape, const AttentionParams& p,
+                       bool make_q_strided = false) {
+  size_t need = 1;
+  for (const int64_t d : out_shape) need *= static_cast<size_t>(d);
+  std::vector<float> out(need, 0.0f);
+
+  Tensor qv = view_of(q, q_shape);
+  Tensor kv = view_of(k, k_shape);
+  Tensor vv = view_of(v, v_shape);
+  Tensor ov = view_of(out, std::move(out_shape));
+  if (make_q_strided) {
+    // Same shape, wrong strides: laid out as [B, H, D, S] but described as
+    // [B, H, S, D]. Only require_contiguous() can catch this -- every shape
+    // check still passes, and reading it as dense would silently mix up
+    // elements.
+    qv.strides[2] = 1;
+    qv.strides[3] = q_shape[2];
+  }
+  try {
+    cpu::attention(qv, kv, vv, ov, p);
+  } catch (const Error&) {
+    return true;
+  }
+  return false;
+}
+
+LLMRT_TEST(attention_matches_golden) {
+  const AttentionFixture fx = load_attention_fixture();
+  if (!fx.ok) return;
+  const std::vector<float> out = run_attention(fx);
+  const golden::Diff d = golden::compare(out.data(), fx.want.data(), fx.want.size());
+  std::printf("      attention  %s\n", golden::diff_string(d).c_str());
+  CHECK_MSG(golden::within(d), "attention: " + golden::diff_string(d));
+}
+
+// Row 0 is structurally special: the causal mask leaves exactly one visible key,
+// so softmax assigns it probability 1 and the output must equal v[g][0] with no
+// accumulation at all (the masked probabilities are exactly 0, and adding zero
+// does not perturb a float). A wrong mask, a wrong GQA mapping or a wrong output
+// layout each breaks this immediately, and it needs no reference data.
+LLMRT_TEST(attention_row_zero_equals_the_value_of_its_only_visible_key) {
+  const AttentionFixture fx = load_attention_fixture();
+  if (!fx.ok) return;
+  const std::vector<float> out = run_attention(fx);
+  const int64_t groups = fx.H / fx.Kv;
+  for (int64_t h = 0; h < fx.H; ++h) {
+    const int64_t g = h / groups;
+    for (int64_t d = 0; d < fx.D; ++d) {
+      const size_t got = static_cast<size_t>(h * fx.D + d);              // out[0][0][h*D+d]
+      const size_t want = static_cast<size_t>((g * fx.S + 0) * fx.D + d);  // v[g][0][d]
+      CHECK_NEAR(out[got], fx.v[want], 1e-6f);
+    }
+  }
+}
+
+// Negative control. With the mask off, row 0 attends to every key, so the result
+// must stop matching. Both runs are checked, because otherwise this test passes
+// on a stub too: an all-zero output yields cosine 1.0 via the denom == 0
+// fallback, so "does not match" alone is not evidence of anything.
+LLMRT_TEST(attention_without_the_causal_mask_does_not_match_golden) {
+  const AttentionFixture fx = load_attention_fixture();
+  if (!fx.ok) return;
+  const std::vector<float> masked = run_attention(fx, /*causal=*/true);
+  const std::vector<float> open = run_attention(fx, /*causal=*/false);
+  const golden::Diff d_masked =
+      golden::compare(masked.data(), fx.want.data(), fx.want.size());
+  const golden::Diff d_open = golden::compare(open.data(), fx.want.data(), fx.want.size());
+  std::printf("      with causal mask  %s\n", golden::diff_string(d_masked).c_str());
+  std::printf("      without mask      %s\n", golden::diff_string(d_open).c_str());
+  CHECK_MSG(golden::within(d_masked),
+            "causal attention should match: " + golden::diff_string(d_masked));
+  CHECK_MSG(!golden::within(d_open),
+            "disabling the causal mask still matched the golden, so the attention "
+            "golden test has no discriminating power: " +
+                golden::diff_string(d_open));
+}
+
+LLMRT_TEST(attention_rejects_mismatched_kv_shapes) {
+  const AttentionFixture fx = load_attention_fixture();
+  if (!fx.ok) return;
+  // k and v must agree; give k one fewer key position.
+  const std::vector<float> k_short(fx.k.begin(), fx.k.end() - fx.D);
+  CHECK_TRUE(attention_rejects(fx.q, {fx.B, fx.H, fx.S, fx.D}, k_short,
+                               {fx.B, fx.Kv, fx.S - 1, fx.D}, fx.v,
+                               {fx.B, fx.Kv, fx.S, fx.D}, {fx.B, fx.S, fx.H * fx.D},
+                               attention_params(fx)));
+}
+
+LLMRT_TEST(attention_rejects_sequence_major_output_shape) {
+  const AttentionFixture fx = load_attention_fixture();
+  if (!fx.ok) return;
+  // [B, S, H, D] has the same element count as [B, S, H*D]; only a rank check
+  // distinguishes them, and using the wrong one flips the layout of the result.
+  CHECK_TRUE(attention_rejects(fx.q, {fx.B, fx.H, fx.S, fx.D}, fx.k,
+                               {fx.B, fx.Kv, fx.S, fx.D}, fx.v,
+                               {fx.B, fx.Kv, fx.S, fx.D}, {fx.B, fx.S, fx.H, fx.D},
+                               attention_params(fx)));
+}
+
+LLMRT_TEST(attention_rejects_non_divisible_gqa) {
+  const AttentionFixture fx = load_attention_fixture();
+  if (!fx.ok) return;
+  AttentionParams p = attention_params(fx);
+  p.num_kv_heads = 5;  // 16 % 5 != 0, so no GQA grouping exists
+  CHECK_TRUE(attention_rejects(fx.q, {fx.B, fx.H, fx.S, fx.D}, fx.k,
+                               {fx.B, fx.Kv, fx.S, fx.D}, fx.v,
+                               {fx.B, fx.Kv, fx.S, fx.D}, {fx.B, fx.S, fx.H * fx.D}, p));
+}
+
+LLMRT_TEST(attention_rejects_non_contiguous_input) {
+  const AttentionFixture fx = load_attention_fixture();
+  if (!fx.ok) return;
+  CHECK_TRUE(attention_rejects(fx.q, {fx.B, fx.H, fx.S, fx.D}, fx.k,
+                               {fx.B, fx.Kv, fx.S, fx.D}, fx.v,
+                               {fx.B, fx.Kv, fx.S, fx.D}, {fx.B, fx.S, fx.H * fx.D},
+                               attention_params(fx), /*make_q_strided=*/true));
+}
+
 int main() { return llmrt_test::run_all("ops_cpu"); }

@@ -18,6 +18,31 @@
 #include "llmrt/tensor.h"
 
 namespace llmrt {
+
+// Everything attention needs that cannot be read off the tensors.
+//
+// Lives in llmrt rather than llmrt::cpu because it describes the *operation*,
+// not an implementation of it: the OpenCL backend (Phase 5) and the IBackend
+// interface will use this same struct.
+//
+// There is deliberately no `scale` field: Qwen3 defines it as head_dim ** -0.5,
+// and deriving it here means a caller cannot pass a value that disagrees with
+// what the reference used. Measured that (float)(1.0 / sqrt((double)d)) and
+// 1.0f / sqrtf((float)d) are the same bits for d = 128 (0x3db504f3), so the
+// exact spelling does not matter.
+struct AttentionParams {
+  int64_t num_heads = 0;
+  int64_t num_kv_heads = 0;
+  int64_t head_dim = 0;
+  bool causal = true;
+
+  // GQA: kv head g serves query heads [g*k, (g+1)*k). Matches the reference's
+  // repeat_kv, which expands along an inserted middle axis and then reshapes.
+  int64_t num_kv_groups() const {
+    return num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
+  }
+};
+
 namespace cpu {
 
 // Root-mean-square layer normalisation over the LAST axis:
@@ -112,15 +137,46 @@ void rope_apply(Tensor& q, Tensor& k, const Tensor& cos, const Tensor& sin);
 //
 // Row semantics match rmsnorm: `x` and `out` share a shape of rank >= 1, the
 // leading axes are independent rows flattened, and the last axis is the one
-// normalised. -inf entries are supported and come out as exactly 0, which is
-// how the causal mask is applied (attention adds -inf above the diagonal).
-// A row that is entirely -inf yields NaN, so callers must guarantee at least one
-// unmasked entry -- true for causal attention, where row 0 sees position 0.
+// normalised. Deeply negative entries come out as exactly 0, which is how the
+// causal mask takes effect: attention adds a very negative constant above the
+// diagonal and exp() underflows it to 0.
+//
+// A row that is *entirely* that constant is the caller's choice: -inf gives
+// NaN, a finite value such as -FLT_MAX gives a uniform distribution. Attention
+// passes -FLT_MAX to match the reference; see the note there.
 //
 // Note this op takes an explicit output, like the others; attention later fuses
 // it into a single kernel (Phase 8), at which point it stops being called
 // standalone.
 void softmax(const Tensor& x, Tensor& out);
+
+// Scaled dot-product attention with grouped-query attention and an optional
+// causal mask.
+//
+//   q   [B, H,  S, D]    after QK-Norm and RoPE
+//   k   [B, Kv, S, D]    after QK-Norm and RoPE
+//   v   [B, Kv, S, D]    straight from v_proj -- v gets no RoPE
+//   out [B, S, H*D]      the o_proj input
+//
+// `out` is NOT [B, H, S, D]. The reference does
+// `attn_output.transpose(1, 2).reshape(B, S, -1)`, folding the head axis into
+// the last one in head-major order: out[b][s][h*D + d]. Since H*D == 2048 ==
+// the flattened size either way, a transposed layout is invisible to a shape
+// check and costs rel ~1.0 against the golden.
+//
+// Per (batch, head h), with g = h / num_kv_groups and scale = 1/sqrt(head_dim):
+//
+//   scores[j] = (sum_d q[h][i][d] * k[g][j][d]) * scale
+//   scores[j] += mask[i][j]                          -FLT_MAX where masked
+//   probs     = softmax(scores)                      fp32, over j
+//   out[i][h*D + d] = sum_j probs[j] * v[g][j][d]
+//
+// The mask value is -FLT_MAX (torch.finfo(float32).min), not -inf. For a row
+// with any unmasked entry both give the same result, but a fully masked row
+// becomes uniform with -FLT_MAX (m == -FLT_MAX, exp(0) == 1) and NaN with -inf.
+// The reference uses -FLT_MAX, so this does too.
+void attention(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out,
+               const AttentionParams& params);
 
 }  // namespace cpu
 }  // namespace llmrt

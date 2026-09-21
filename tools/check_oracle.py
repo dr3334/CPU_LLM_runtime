@@ -175,7 +175,14 @@ def main() -> int:
     kk = np.repeat(kr, n_rep, axis=1)  # [1, H, S, D]
     vv = np.repeat(vr, n_rep, axis=1)
     attn = (qr @ kk.transpose(0, 1, 3, 2)) * scale  # [1, H, S, S]
-    mask = np.triu(np.full((seq, seq), -np.inf, dtype=np.float32), k=1)
+    # The reference fills the masked half with torch.finfo(float32).min
+    # (== -FLT_MAX), not -inf. Under a causal mask the two agree: every row has
+    # at least the diagonal unmasked, and exp() underflows either one to 0. They
+    # diverge only on a fully masked row, where -FLT_MAX yields a uniform
+    # distribution (m == -FLT_MAX, so exp(0) == 1) and -inf yields NaN. Using
+    # the reference's value keeps this spec honest for padding masks too.
+    min_dtype = np.float32(np.finfo(np.float32).min)
+    mask = np.triu(np.full((seq, seq), min_dtype, dtype=np.float32), k=1)
     attn = attn + mask[None, None, :, :]
     attn = attn - attn.max(axis=-1, keepdims=True)
     ex = np.exp(attn)
