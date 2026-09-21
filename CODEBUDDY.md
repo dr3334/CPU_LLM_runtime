@@ -184,12 +184,18 @@ include/llmrt/       public headers
   convert.h          bf16/f16 -> f32
   config.h           Qwen3Config
   model.h            weight binding (Qwen3Weights, LayerWeights)
+  ops.h              the op contracts (see below)
+  forward.h          F32Weights + Qwen3Forward (the 28-layer stack)
+  generate.h         greedy generation, two prompt modes
 src/core/            json, tensor, version
 src/io/              safetensors, convert
-src/model/           config, weights
+src/model/           config, weights, forward, generate
+src/ops/cpu/         rmsnorm, matmul, swiglu, rope, softmax, attention,
+                     embedding, argmax
 src/cli/             main + one cmd_*.cpp per subcommand (thin, no logic)
 tools/               Python: golden generation, oracle checking
-tests/               harness + one file per area; golden.h loads fixtures
+tests/               harness + one file per area; golden.h loads fixtures,
+                     model_fixture.h loads the checkpoint once per binary
 kernels/             (reserved for hand-written OpenCL)
 ```
 
@@ -202,37 +208,63 @@ buffer as `[seq, heads, dim]` and as `[heads, seq, dim]`; the CPU ops currently
 require contiguous input and call `require_contiguous()` to reject strided
 views loudly rather than reading the wrong elements.
 
-Implemented today: the metadata and loading layer. `llmrt inspect` prints the
-config, the full tensor table and the memory footprint, and is the fastest way
-to check a checkpoint:
+`ops.h` is **the list of primitives each backend implements**, not a list of
+"model maths" — `embedding` is a gather and `argmax` is a reduction, and both
+are there because a GPU backend wants them natively. What lives in `forward.h` /
+`generate.h` instead is sequencing and policy: the layer order, the head
+transposes, the chat wrapper, end-of-sequence handling. Ops never allocate;
+the model layer owns its scratch.
+
+Implemented today: metadata and loading, all eight CPU ops checked against
+golden, the full 28-layer forward, and greedy generation.
 
 ```bash
-./build/llmrt inspect              # full 311-row tensor table
-./build/llmrt inspect --summary    # skip the table
+./build/llmrt inspect --summary                            # weights and footprint
+./build/llmrt generate --ids 785,6722,315 --mode raw       # continue text
+./build/llmrt generate --ids 785,6722,315 --mode chat      # answer a question
 ```
 
-## Roadmap (NOT yet implemented)
+## Roadmap
 
-Tracking the approved plan; nothing below exists in the code yet.
+Tracking the approved plan. Status as of the layout section above:
 
-1. Hand-written CPU ops (matmul, rmsnorm, qk_norm, rope, GQA attention, swiglu,
-   softmax, embedding), each checked op-by-op against `data/golden/ops/*`.
-2. Full 28-layer forward + byte-level BPE tokenizer + greedy sampling.
-3. KV cache and the memory manager.
-4. OpenCL backend: hand-written kernels, `cl_event` profiling, buffer pool.
-5. Heterogeneous scheduler: `--split 0-13:cpu,14-27:opencl`, boundary
+1. ✅ Hand-written CPU ops — rmsnorm (which covers qk_norm), matmul, swiglu, rope,
+   softmax, attention, embedding, argmax. All eight checked against
+   `data/golden/`, each with a negative control proving the check discriminates.
+2. 🔶 Full 28-layer forward ✅ (matches golden to rel 9.6e-06 worst case),
+   greedy sampling ✅. **Missing: the tokenizer.** Decode is a table lookup and
+   is cheap; encode needs the pre-tokenization regex, which uses Unicode
+   property escapes (`\p{L}`, `\p{N}`) that `std::regex` cannot express. That is
+   an open decision — see `docs/DECISIONS.md`.
+   Until then: ids in, ids out, and the chat wrapper is expressed as token ids
+   so neither mode needs a tokenizer.
+3. ⬜ KV cache and the memory manager. First measured target: generation is
+   1.68 s/token today because every step re-forwards the whole prefix. Note the
+   KV cache cuts the attention term (O(S²) → O(S)) but **not** the weight
+   traffic, which is what actually dominates.
+4. ⬜ OpenCL backend: hand-written kernels, `cl_event` profiling, buffer pool.
+5. ⬜ Heterogeneous scheduler: `--split 0-13:cpu,14-27:opencl`, boundary
    transfers, double buffering.
-6. Profiling report: TTFT, prefill/decode tok/s, per-layer and per-transfer
+6. ⬜ Profiling report: TTFT, prefill/decode tok/s, per-layer and per-transfer
    timings.
-7. Android CLI, then the APK, then ONNX.
+7. ⬜ Android CLI, then the APK, then ONNX.
 
 The shared abstraction these hang off is `IBackend` (see the plan file):
 ops plus buffer management, so a layer's weights and KV cache live on the
 device that executes it, and the scheduler inserts host<->device copies only at
 placement boundaries.
 
-Note on OpenCL: this WSL machine has only the ICD loader, no vendor ICD and no
-`/usr/include/CL`, so OpenCL kernels cannot be developed or tested locally
-until POCL is installed (`sudo apt install pocl-opencl-icd opencl-headers
-ocl-icd-opencl-dev clinfo`). `libOpenCL.so` exists only on an actual device,
-where it must be `dlopen`ed (Android ships no standard ICD loader).
+Note on OpenCL in WSL: this machine has only the ocl-icd loader, no vendor ICD
+(`/etc/OpenCL/vendors` does not exist), so `clGetPlatformIDs` returns
+`CL_PLATFORM_NOT_FOUND_KHR` and there is no device to develop against.
+`sudo apt install pocl-opencl-icd opencl-headers ocl-icd-opencl-dev clinfo`
+fixes that; extracting the .deb without root does not work, because Ubuntu's
+POCL 1.8 links against LLVM 11 which is not installed.
+
+An earlier note here claimed `libOpenCL.so` "must be dlopen'ed on Android since
+there is no standard ICD loader". That is wrong, or at least not how it is
+normally done: llama.cpp's OpenCL backend targets Android by building the
+Khronos ICD loader from source, dropping `libOpenCL.so` into the NDK sysroot and
+linking against it. It also uses NDK 26.3.11579264, the same one this project
+targets, and embeds the kernels into the binary by default
+(`GGML_OPENCL_EMBED_KERNELS=ON`). Worth following when Phase 4 starts.
