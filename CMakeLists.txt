@@ -24,6 +24,7 @@ add_library(llmrt_core STATIC
   src/io/convert.cpp
   src/io/safetensors.cpp
   src/model/config.cpp
+  src/model/forward.cpp
   src/model/weights.cpp
   src/ops/cpu/attention.cpp
   src/ops/cpu/embedding.cpp
