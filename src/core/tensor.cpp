@@ -105,16 +105,32 @@ void* Tensor::raw() {
 
 const void* Tensor::raw() const { return const_cast<Tensor*>(this)->raw(); }
 
-float* Tensor::f32() {
-  LLMRT_CHECK(device == DeviceKind::CPU,
-              std::string("Tensor::f32: tensor lives on ") + device_name(device) +
+namespace {
+// Shared by the typed accessors: "hand me a host pointer of exactly this
+// dtype, or tell me why you cannot". Keeping both checks in one place means a
+// new accessor cannot accidentally skip the device test and end up
+// dereferencing a cl_mem.
+void* checked_host_ptr(Tensor& t, DType want, const char* who) {
+  LLMRT_CHECK(t.device == DeviceKind::CPU,
+              std::string(who) + ": tensor lives on " + device_name(t.device) +
                   ", not on the host");
-  LLMRT_CHECK(dtype == DType::F32,
-              std::string("Tensor::f32: dtype is ") + dtype_name(dtype) + ", not F32");
-  return static_cast<float*>(raw());
+  LLMRT_CHECK(t.dtype == want, std::string(who) + ": dtype is " + dtype_name(t.dtype) +
+                                   ", not " + dtype_name(want));
+  return t.raw();
+}
+}  // namespace
+
+float* Tensor::f32() {
+  return static_cast<float*>(checked_host_ptr(*this, DType::F32, "Tensor::f32"));
 }
 
 const float* Tensor::f32() const { return const_cast<Tensor*>(this)->f32(); }
+
+int32_t* Tensor::i32() {
+  return static_cast<int32_t*>(checked_host_ptr(*this, DType::I32, "Tensor::i32"));
+}
+
+const int32_t* Tensor::i32() const { return const_cast<Tensor*>(this)->i32(); }
 
 void Tensor::require_contiguous(const char* who) const {
   LLMRT_CHECK(is_contiguous(), std::string(who) +

@@ -77,6 +77,13 @@ struct Tensor {
   float* f32();
   const float* f32() const;
 
+  // Index buffers (token ids, gather indices). Deliberately a separate name
+  // rather than a template: reading an id buffer through f32() would silently
+  // reinterpret 2 int32s as 2 floats on some paths and 1 float on others, and
+  // no arithmetic op should ever accept an I32 tensor.
+  int32_t* i32();
+  const int32_t* i32() const;
+
   // Untyped escape hatch, for handing the raw pointer to a backend. Returns
   // data + offset * element_size, so views resolve correctly.
   void* raw();

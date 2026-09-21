@@ -14,10 +14,17 @@ namespace llmrt {
 
 // Storage element type. F32 is the compute dtype for the whole runtime in the
 // first milestones; BF16 is what Qwen3 checkpoints ship with on disk.
+//
+// I32 exists only so that index buffers -- token ids today, gather indices
+// later -- can be described by a Tensor and therefore live on a device. It is
+// never a weight or compute dtype, and convert_to_f32() refuses it: silently
+// turning ids into floats would lose precision above 2^24 and, worse, invite
+// arithmetic on values that are not quantities.
 enum class DType : uint8_t {
   F32 = 0,
   BF16,
   F16,
+  I32,
   I8,
   I4,
 };
@@ -34,6 +41,7 @@ inline const char* dtype_name(DType t) {
     case DType::F32: return "F32";
     case DType::BF16: return "BF16";
     case DType::F16: return "F16";
+    case DType::I32: return "I32";
     case DType::I8: return "I8";
     case DType::I4: return "I4";
   }
@@ -56,6 +64,7 @@ inline size_t dtype_size(DType t) {
     case DType::F32: return 4;
     case DType::BF16: return 2;
     case DType::F16: return 2;
+    case DType::I32: return 4;
     case DType::I8: return 1;
     case DType::I4: return 1;
   }

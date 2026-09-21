@@ -50,6 +50,13 @@ void convert_to_f32(const void* src, DType src_dtype, float* dst, size_t count) 
       for (size_t i = 0; i < count; ++i) dst[i] = f16_to_f32(p[i]);
       break;
     }
+    case DType::I32:
+      // Refused on purpose. An I32 tensor holds indices, not quantities --
+      // silently widening token ids into floats works right up until an id
+      // exceeds 2^24 and the value stops being representable, and it invites
+      // arithmetic on numbers that have no magnitude. Anything that needs to
+      // read an id buffer uses Tensor::i32(), which is also dtype-checked.
+      LLMRT_CHECK(false, "convert_to_f32: I32 is an index buffer, not a numeric type");
     case DType::I8: {
       const int8_t* p = static_cast<const int8_t*>(src);
       for (size_t i = 0; i < count; ++i) dst[i] = static_cast<float>(p[i]);

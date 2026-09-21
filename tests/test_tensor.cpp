@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "llmrt/common.h"
+#include "llmrt/convert.h"
 #include "llmrt/tensor.h"
 
 #include "test_framework.h"
@@ -219,6 +220,39 @@ LLMRT_TEST(f32_accessor_checks_dtype_and_device) {
   CHECK_TRUE(throws([&] { (void)gpu.f32(); }));
   // raw() is still usable to hand the handle to a backend.
   CHECK_TRUE(gpu.raw() == reinterpret_cast<void*>(0x10));
+}
+
+LLMRT_TEST(i32_accessor_is_separate_from_f32) {
+  std::vector<int32_t> ids = {7, 151936 - 1, 0, -3};  // includes the vocab edge
+  Tensor t = Tensor::contiguous(ids.data(), DType::I32, DeviceKind::CPU, {4});
+  CHECK_TRUE(t.i32() == ids.data());
+  CHECK_TRUE(static_cast<const Tensor&>(t).i32() == ids.data());
+  for (size_t i = 0; i < ids.size(); ++i) CHECK_EQ(t.i32()[i], ids[i]);
+
+  CHECK_EQ(t.nbytes(), size_t{16});
+  CHECK_EQ(t.element_size(), size_t{4});
+
+  // The two accessors are not interchangeable in either direction: reading an
+  // id buffer as floats would reinterpret the bytes, and reading activations as
+  // ints would give nonsense indices. Both must be refused, not converted.
+  CHECK_TRUE(throws([&] { (void)t.f32(); }));
+  Tensor f = Tensor::contiguous(nullptr, DType::F32, DeviceKind::CPU, {4});
+  CHECK_TRUE(throws([&] { (void)f.i32(); }));
+
+  // And the device check applies to i32() too.
+  Tensor gpu = Tensor::contiguous(reinterpret_cast<void*>(0x10), DType::I32, DeviceKind::OpenCL,
+                                  {4});
+  CHECK_TRUE(throws([&] { (void)gpu.i32(); }));
+}
+
+LLMRT_TEST(convert_refuses_i32_rather_than_widening_ids) {
+  // Widening ids to floats works until an id exceeds 2^24, so the conversion is
+  // refused outright instead of being silently available.
+  CHECK_TRUE(!is_dtype_convertible(DType::I32));
+  const int32_t id = 12345;
+  float out = 0.0f;
+  CHECK_TRUE(throws([&] { convert_to_f32(&id, DType::I32, &out, 1); }));
+  CHECK_NEAR(out, 0.0f, 0.0f);  // untouched
 }
 
 LLMRT_TEST(descriptions_name_dtype_shape_device_and_layout) {
