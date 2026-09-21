@@ -160,6 +160,19 @@ rel > tol * 0.5    fragile -- find another formulation
 Current margins: rmsnorm 88x, matmul 79x, swiglu 3500x (purely elementwise, so
 `exp` is its only error source).
 
+## Decisions and open issues
+
+`docs/DECISIONS.md` records every design decision (what, why, where the code is)
+plus the alternatives that were considered and the optimizations that are
+deferred with their measured costs. Each entry is bound to the git commit hash
+that established it, so the reasoning can be checked against the code that was
+actually written at that point.
+
+Read it before proposing a change to the op contracts, the layout conventions or
+the weight format — the trade-off has probably already been measured. If you do
+change your mind, append a new entry rather than editing the old one, and note
+which it supersedes.
+
 ## Layout
 
 ```
